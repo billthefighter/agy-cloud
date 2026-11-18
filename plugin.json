@@ -1,0 +1,5 @@
+{
+  "name": "agy-cloud",
+  "version": "0.1.0",
+  "description": "Cloud session handoff (/handoff) with sleep-resilient poll-on-wake and extensible server/client plugin framework for Google Antigravity on k3s."
+}

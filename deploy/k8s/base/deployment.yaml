@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agy-cloud-controller
+  namespace: agy-cloud
+  labels:
+    app.kubernetes.io/name: agy-cloud-controller
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agy-cloud-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agy-cloud-controller
+    spec:
+      containers:
+        - name: controller
+          image: ghcr.io/your-org/agy-cloud:latest
+          args:
+            - "serve"
+            - "--host=0.0.0.0"
+            - "--port=8080"
+            - "--state-dir=/state"
+            - "--plugins-dir=/app/plugins"
+            - "--config=/etc/agy-cloud/config.yaml"
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: agy-cloud-secrets
+                optional: true
+          volumeMounts:
+            - name: state
+              mountPath: /state
+            - name: config
+              mountPath: /etc/agy-cloud
+              readOnly: true
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: agy-cloud-state
+        - name: config
+          configMap:
+            name: agy-cloud-config

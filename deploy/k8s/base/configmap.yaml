@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agy-cloud-config
+  namespace: agy-cloud
+data:
+  config.yaml: |
+    plugin_sources: []
+    plugins:
+      repo_healer:
+        enabled: true
+        default_repo: "example-org/example-repo"
+        default_branch: "main"
+        verify_hint: "pytest"

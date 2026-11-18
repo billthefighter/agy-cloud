@@ -1,0 +1,16 @@
+api_version: agy.cloud/v1
+id: repo_healer
+name: Autonomous Repo Coding & CI Healer
+version: 0.1.0
+description: Spawns sandboxed Kubernetes Antigravity worker pods for on-demand `!code` requests and CI/Sentry triage.
+author: Lucas Whipple
+entrypoint: server:RepoHealerPlugin
+channel_roles:
+  - role: coding
+    title: Coding Tasks Feed
+    description: Interactive mobile coding & PR triage threads
+push_categories:
+  - id: coding
+    label: Coding & PR Triage
+    default_enabled: true
+skills_dir: skills

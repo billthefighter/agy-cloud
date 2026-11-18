@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agy-cloud"
+version = "0.1.0"
+description = "Microkernel Kubernetes cloud handoff runtime and extensible git/entry-point plugin framework for Google Antigravity agents"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "agy-cloud contributors" }]
+dependencies = [
+    "fastapi>=0.115.0",
+    "httpx>=0.28.0",
+    "pydantic>=2.10.0",
+    "pyyaml>=6.0.2",
+    "structlog>=24.4.0",
+    "uvicorn>=0.32.0",
+]
+
+[project.optional-dependencies]
+k8s = [
+    "kubernetes>=31.0.0",
+]
+slack = [
+    "slack-bolt>=1.21.2",
+    "aiohttp>=3.11.0",
+]
+worker = [
+    "google-antigravity>=0.1.0",
+]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.8.0",
+]
+
+[project.scripts]
+agy-cloud = "agy_cloud.cli:main"
+agy-handoff = "agy_cloud.client.handoff_client:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agy_cloud"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

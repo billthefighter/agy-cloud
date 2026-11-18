@@ -1,0 +1,5 @@
+{
+  "name": "agy-plugin-repo-healer",
+  "version": "0.1.0",
+  "description": "Autonomous repository coding and CI healer plugin for agy-cloud."
+}

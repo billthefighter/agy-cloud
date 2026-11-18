@@ -1,0 +1,34 @@
+# agy-cloud Cluster Configuration (mounted from a Kubernetes ConfigMap)
+#
+# 1. External Plugin Git Repositories (`plugin_sources`):
+#    Each entry clones/fetches a single-plugin or multi-plugin Git repository
+#    and loads its bundled `plugin.yaml` + `config.yaml` defaults.
+plugin_sources:
+  - repo: https://github.com/your-org/agy-plugins-health.git
+    ref: main                  # branch, tag, or pinned commit SHA
+    subpath: ""                # optional subdirectory inside the repo
+    auth_env: GITHUB_TOKEN     # optional env var name for private repos (never written to disk)
+
+# 2. Cluster ConfigMap Overrides (`plugins.<plugin_id>`):
+#    Deep-merged on top of the plugin repository's bundled `default_config` / `config.yaml`.
+#    Supports `${ENV_VAR:-default}` interpolation from Kubernetes Secrets, and can also be
+#    overridden by `AGY_PLUGIN_<ID>_<FIELD>` environment variables.
+plugins:
+  repo_healer:
+    enabled: true
+    default_repo: "your-org/your-app"
+    default_branch: "main"
+    verify_hint: "uv run pytest"
+    default_model: "gemini-4-hydrogen"
+
+  garmin:
+    enabled: true
+    active_factor: 0.85
+    api_key: "${GARMIN_API_KEY:-}"
+
+  health:
+    enabled: true
+    timezone: "UTC"
+    default_calories_kcal: 2200
+    default_protein_g: 180.0
+    use_garmin_dynamic_target: true
