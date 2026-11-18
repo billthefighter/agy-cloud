@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-tasks-pwa
+  namespace: agent-tasks
+  labels:
+    app.kubernetes.io/name: agent-tasks-pwa
+    app.kubernetes.io/component: gateway
+    app.kubernetes.io/part-of: agent-tasks
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: agent-tasks-controller
+  ports:
+    - name: http-pwa
+      port: 8080
+      targetPort: http-pwa
+      protocol: TCP

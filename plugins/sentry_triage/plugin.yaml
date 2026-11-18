@@ -1,0 +1,14 @@
+api_version: agy.cloud/v1
+id: sentry_triage
+name: Autonomous Sentry Issue Triage & PR Orchestrator
+version: 0.1.0
+description: Polls Sentry issues, checks release SHA lag, spawns sandboxed Antigravity worker pods, and posts interactive PR review cards.
+entrypoint: server:SentryTriagePlugin
+channel_roles:
+  - role: sentry
+    title: Sentry Triage Feed
+    description: Automated Sentry root-cause analysis and Draft PR review threads
+push_categories:
+  - id: sentry
+    label: Sentry Issue Triage
+    default_enabled: true

@@ -1,0 +1,14 @@
+api_version: agy.cloud/v1
+id: ci_healer
+name: GitHub Actions CI Failure Healer
+version: 0.1.0
+description: Watches GitHub Actions workflow failures and dispatches worker pods to propose PR branch fixes.
+entrypoint: server:CiHealerPlugin
+channel_roles:
+  - role: ci
+    title: CI Healer Feed
+    description: GitHub Actions failure diagnostics and automated branch fix proposals
+push_categories:
+  - id: ci
+    label: CI Failures & Auto-Heals
+    default_enabled: true

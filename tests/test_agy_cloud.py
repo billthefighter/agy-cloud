@@ -119,7 +119,7 @@ plugins:
 
     static_js = client.get("/api/plugins/health/static/health_view.js")
     assert static_js.status_code == 200
-    assert "mountHealthView" in static_js.text
+    assert "renderHealthTabBar" in static_js.text
 
     # 2. Standalone PWA mount `/health/` rendered by plugin spec
     pwa_html = client.get("/health/")

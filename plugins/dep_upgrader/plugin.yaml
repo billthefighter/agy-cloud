@@ -1,0 +1,14 @@
+api_version: agy.cloud/v1
+id: dep_upgrader
+name: Automated Dependency & Security Upgrader
+version: 0.1.0
+description: Runs scheduled and on-demand `!deps` Python/Node dependency audits and opens upgrade PRs.
+entrypoint: server:DepUpgraderPlugin
+channel_roles:
+  - role: deps
+    title: Dependency Upgrader
+    description: Weekly and on-demand dependency audit threads
+push_categories:
+  - id: deps
+    label: Dependency Upgrades
+    default_enabled: true

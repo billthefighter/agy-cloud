@@ -1,0 +1,122 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-tasks-controller
+  namespace: agent-tasks
+  labels:
+    app.kubernetes.io/name: agent-tasks-controller
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/part-of: agent-tasks
+spec:
+  replicas: 1
+  # Recreate is mandatory so multi-node makesense local-path ReadWriteOnce PVC
+  # never deadlocks during controller rollouts.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agent-tasks-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agent-tasks-controller
+        app.kubernetes.io/component: controller
+        app.kubernetes.io/part-of: agent-tasks
+    spec:
+      serviceAccountName: agent-tasks-controller
+      imagePullSecrets:
+        - name: ghcr-pull
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: ghcr.io/billthefighter/agent-tasks-controller:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http-pwa
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: MY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: STATE_DIR
+              value: /state
+            - name: STATE_PVC_NAME
+              value: agent-tasks-state
+            - name: TARGETS_CONFIG_PATH
+              value: /etc/agent-tasks/targets.yaml
+            - name: WORKER_IMAGE
+              value: ghcr.io/billthefighter/agent-tasks-worker:latest
+            - name: WORKER_MODEL
+              value: gemini-4-hydrogen
+            - name: WORKER_SERVICE_ACCOUNT
+              value: agent-tasks-worker
+            - name: WORKER_SECRET_NAME
+              value: agent-tasks-worker-secret
+            - name: IMAGE_PULL_SECRET_NAME
+              value: ghcr-pull
+            - name: PWA_BASE_PATH
+              value: /agy
+            - name: PWA_HEALTH_BASE_PATH
+              value: /health
+            - name: PWA_PORT
+              value: "8080"
+          envFrom:
+            - secretRef:
+                name: agent-tasks-controller-secret
+            - secretRef:
+                name: agent-tasks-worker-secret
+                optional: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 750m
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            httpGet:
+              path: /agy/healthz
+              port: http-pwa
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          livenessProbe:
+            exec:
+              command: ["python3", "-c", "import os, time; assert time.time() - os.path.getmtime('/tmp/heartbeat') < 600"]
+            initialDelaySeconds: 30
+            periodSeconds: 60
+          volumeMounts:
+            - name: state
+              mountPath: /state
+            - name: targets-config
+              mountPath: /etc/agent-tasks
+              readOnly: true
+            - name: pwa-ca
+              mountPath: /etc/agent-tasks-ca
+              readOnly: true
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: agent-tasks-state
+        - name: targets-config
+          configMap:
+            name: agent-tasks-targets
+        - name: pwa-ca
+          secret:
+            secretName: agent-tasks-pwa-tls
+            optional: true

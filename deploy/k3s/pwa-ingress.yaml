@@ -1,0 +1,95 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: agent-tasks-pwa-tls
+  namespace: agent-tasks
+  labels:
+    app.kubernetes.io/part-of: agent-tasks
+spec:
+  secretName: agent-tasks-pwa-tls
+  duration: 8760h
+  renewBefore: 720h
+  commonName: makesense-k3s.netbird.cloud
+  dnsNames:
+    - makesense-k3s.netbird.cloud
+    - rattlsnek-dev-k3s.netbird.cloud
+    - argocd.home.lan
+  usages:
+    - digital signature
+    - key encipherment
+    - server auth
+  issuerRef:
+    name: homelab-ca
+    kind: ClusterIssuer
+    group: cert-manager.io
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: agent-tasks-pwa
+  namespace: agent-tasks
+  labels:
+    app.kubernetes.io/part-of: agent-tasks
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - makesense-k3s.netbird.cloud
+        - rattlsnek-dev-k3s.netbird.cloud
+        - argocd.home.lan
+      secretName: agent-tasks-pwa-tls
+  rules:
+    - host: makesense-k3s.netbird.cloud
+      http:
+        paths:
+          - path: /agy
+            pathType: Prefix
+            backend:
+              service:
+                name: agent-tasks-pwa
+                port:
+                  number: 8080
+          - path: /health
+            pathType: Prefix
+            backend:
+              service:
+                name: agent-tasks-pwa
+                port:
+                  number: 8080
+    - host: rattlsnek-dev-k3s.netbird.cloud
+      http:
+        paths:
+          - path: /agy
+            pathType: Prefix
+            backend:
+              service:
+                name: agent-tasks-pwa
+                port:
+                  number: 8080
+          - path: /health
+            pathType: Prefix
+            backend:
+              service:
+                name: agent-tasks-pwa
+                port:
+                  number: 8080
+    - host: argocd.home.lan
+      http:
+        paths:
+          - path: /agy
+            pathType: Prefix
+            backend:
+              service:
+                name: agent-tasks-pwa
+                port:
+                  number: 8080
+          - path: /health
+            pathType: Prefix
+            backend:
+              service:
+                name: agent-tasks-pwa
+                port:
+                  number: 8080

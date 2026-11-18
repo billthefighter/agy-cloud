@@ -1,0 +1,40 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-tasks-worker-isolation
+  namespace: agent-tasks
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: agy-worker
+  policyTypes:
+    - Ingress
+    - Egress
+  # Deny all inbound connections to ephemeral triage workers.
+  ingress: []
+  egress:
+    # 1. Allow DNS lookups via CoreDNS in kube-system.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # 2. Allow outbound HTTPS (Gemini API, PyPI/uv/npm registries) while blocking
+    #    cluster CIDRs, Proxmox LAN (192.168.0.0/16), NetBird mesh (100.64.0.0/10),
+    #    and link-local metadata endpoints.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443

@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agent-tasks-state
+  namespace: agent-tasks
+  labels:
+    app.kubernetes.io/part-of: agent-tasks
+spec:
+  # makesense k3s uses local-path (node-local ReadWriteOnce).
+  # Spawned worker Jobs pin to the controller's node via nodeSelector + podAffinity.
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 25Gi

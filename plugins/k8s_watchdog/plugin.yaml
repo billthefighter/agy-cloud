@@ -1,0 +1,14 @@
+api_version: agy.cloud/v1
+id: k8s_watchdog
+name: Kubernetes & Argo CD Cluster Watchdog
+version: 0.1.0
+description: Monitors Kubernetes pods (CrashLoopBackOff, OOMKilled, ImagePullBackOff) and Argo CD Application sync/health state.
+entrypoint: server:K8sWatchdogPlugin
+channel_roles:
+  - role: k8s
+    title: K8s & Argo CD Watchdog
+    description: Cluster pod failure and GitOps sync alerts
+push_categories:
+  - id: k8s
+    label: Kubernetes & Argo CD Alerts
+    default_enabled: true
