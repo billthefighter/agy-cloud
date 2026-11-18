@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -17,7 +18,19 @@ from agy_cloud.core.gateway import (
     build_worker_init_script,
     create_microkernel_app,
 )
-from agy_cloud.core.loader import PluginRegistry
+from agy_cloud.core.loader import PluginRegistry, is_pinned_git_ref
+from agy_cloud.core.transports import CompositeChannelBus, OutboundHttpTransport
+from agy_cloud.core.workers import (
+    LocalSubprocessWorkerJobService,
+    build_k8s_worker_job_dict,
+)
+from agy_cloud.sdk import (
+    JobSpec,
+    PluginPermissionError,
+    PluginRepoSource,
+    TransportEntryConfig,
+    WorkerRunnerConfig,
+)
 
 
 @pytest.fixture()
@@ -324,3 +337,155 @@ async def test_scaffold_and_export_client_skills(tmp_path: Path) -> None:
     init_sh = build_worker_init_script()
     assert 'git checkout "$BASE_SHA"' in init_sh
     assert "APPLY_INITIAL_PATCH" in init_sh
+
+
+async def test_per_plugin_python_deps_permissions_and_pinned_refs(
+    tmp_path: Path,
+    external_health_plugins_repo: Path,
+) -> None:
+    # 1. Verify pinned ref validation
+    assert is_pinned_git_ref("v0.1.0") is True
+    assert is_pinned_git_ref("e5463a0") is True
+    assert is_pinned_git_ref("main") is False
+
+    bus = MemoryChannelBus()
+    jobs = RecordingWorkerJobService()
+    installed_cmds: list[list[str]] = []
+
+    def fake_pip_runner(cmd: list[str], **kwargs) -> None:
+        installed_cmds.append(cmd)
+
+    registry = PluginRegistry(
+        state_root=tmp_path / "state",
+        channels=bus,
+        jobs=jobs,
+        pip_installer_runner=fake_pip_runner,
+    )
+
+    # Reject unpinned ref when require_pinned_refs=True
+    with pytest.raises(ValueError, match="unpinned ref"):
+        await registry.load_all(
+            plugin_sources=[PluginRepoSource(repo=str(external_health_plugins_repo), ref="main")],
+            include_entrypoints=False,
+            require_pinned_refs=True,
+        )
+
+    # 2. Create a plugin with `python_dependencies`, `requirements.txt`, and restricted `permissions`
+    plugins_dir = tmp_path / "custom_plugins"
+    pdir = scaffold_new_plugin(plugins_dir, "restricted-bot")
+    (pdir / "requirements.txt").write_text("httpx>=0.28.0\n# comment\n", encoding="utf-8")
+    manifest_txt = (pdir / "plugin.yaml").read_text(encoding="utf-8")
+    manifest_txt += "python_dependencies:\n  - pydantic>=2.10.0\npermissions:\n  - channel_bus\n"
+    (pdir / "plugin.yaml").write_text(manifest_txt, encoding="utf-8")
+
+    await registry.load_all(plugins_dir=plugins_dir, include_entrypoints=False)
+    assert "restricted_bot" in registry.installed_python_packages
+    assert registry.installed_python_packages["restricted_bot"] == [
+        "pydantic>=2.10.0",
+        "httpx>=0.28.0",
+    ]
+    assert len(installed_cmds) == 1
+
+    ctx = registry.plugins["restricted_bot"].context
+    # `channel_bus` was granted, but `sqlite` and `k8s_jobs` were NOT granted:
+    _ = ctx.channels
+    with pytest.raises(PluginPermissionError, match="sqlite"):
+        ctx.sqlite_path("forbidden.sqlite3")
+    with pytest.raises(PluginPermissionError, match="k8s_jobs"):
+        _ = ctx.jobs
+
+
+async def test_pluggable_notification_transports_and_local_worker_runner(
+    tmp_path: Path,
+) -> None:
+    # 1. Verify Discord, Telegram, Ntfy, Slack Webhook, and Generic Webhook transports
+    recorded_requests: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        recorded_requests.append((str(request.url), request.content.decode("utf-8")))
+        return httpx.Response(200, json={"ok": True})
+
+    mock_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    cfgs = [
+        TransportEntryConfig(
+            kind="discord_webhook",
+            url="https://discord.example/api/webhooks/1",
+            roles=["coding"],
+        ),
+        TransportEntryConfig(
+            kind="telegram",
+            url="https://telegram.example",
+            token="tg-tok",
+            chat_id="12345",
+            roles=["coding"],
+        ),
+        TransportEntryConfig(
+            kind="ntfy",
+            url="https://ntfy.example",
+            topic="agy-alerts",
+            roles=["coding"],
+        ),
+        TransportEntryConfig(
+            kind="webhook",
+            url="https://hook.example/events",
+            token="hook-secret",
+            roles=["coding"],
+        ),
+    ]
+    bus = CompositeChannelBus(
+        transports=[OutboundHttpTransport(c, http_client=mock_client) for c in cfgs]
+    )
+    await bus.post_message(
+        "Build succeeded",
+        role="coding",
+        actions=[{"label": "Open PR", "action_id": "pr:open"}],
+    )
+    await mock_client.aclose()
+    assert len(recorded_requests) == 4
+    urls = [u for u, _ in recorded_requests]
+    assert "https://discord.example/api/webhooks/1" in urls
+    assert "https://telegram.example/bottg-tok/sendMessage" in urls
+    assert "https://ntfy.example" in urls
+    assert "https://hook.example/events" in urls
+
+    # 2. Verify LocalSubprocessWorkerJobService & Kubernetes batch/v1 Job manifest builder
+    origin_repo = tmp_path / "origin_repo"
+    origin_repo.mkdir()
+    subprocess.run(["git", "-C", str(origin_repo), "init", "-b", "main"], check=True)
+    subprocess.run(
+        ["git", "-C", str(origin_repo), "config", "user.email", "dev@example.com"], check=True
+    )
+    subprocess.run(["git", "-C", str(origin_repo), "config", "user.name", "Dev"], check=True)
+    (origin_repo / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(origin_repo), "add", "app.py"], check=True)
+    subprocess.run(["git", "-C", str(origin_repo), "commit", "-m", "init"], check=True)
+
+    runner_cfg = WorkerRunnerConfig(
+        mode="local",
+        local_command=[
+            "python3",
+            "-c",
+            "from pathlib import Path; Path('app.py').write_text('VALUE = 42\\n')",
+        ],
+    )
+    local_worker = LocalSubprocessWorkerJobService(
+        state_root=tmp_path / "state",
+        cfg=runner_cfg,
+        repo_resolver={"example-org/app": origin_repo},
+    )
+    job_spec = JobSpec(
+        task_id="local-task-1",
+        short_id="LOCAL-1",
+        plugin_id="core.handoff",
+        github_repo="example-org/app",
+        prompt="Set VALUE = 42",
+    )
+    job_name = await local_worker.spawn_agent_job(job_spec)
+    assert job_name == "local-job-local-task-1-t1"
+    patch_file = tmp_path / "state" / "artifacts" / "local-task-1" / "fix.patch"
+    assert patch_file.is_file()
+    assert "+VALUE = 42" in patch_file.read_text(encoding="utf-8")
+
+    k8s_manifest = build_k8s_worker_job_dict(job_spec, runner_cfg)
+    assert k8s_manifest["kind"] == "Job"
+    assert k8s_manifest["spec"]["template"]["spec"]["automountServiceAccountToken"] is False

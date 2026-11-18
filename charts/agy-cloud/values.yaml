@@ -1,0 +1,29 @@
+image:
+  repository: ghcr.io/your-org/agy-cloud/controller
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8080
+
+persistence:
+  enabled: true
+  size: 10Gi
+  storageClass: ""
+
+secretName: agy-cloud-secrets
+
+config:
+  require_pinned_refs: false
+  install_python_dependencies: true
+  worker_runner:
+    mode: k8s
+    namespace: agy-cloud
+    worker_image: ghcr.io/your-org/agy-cloud/worker:latest
+  plugin_sources: []
+  transports: []
+  plugins:
+    repo_healer:
+      enabled: true
+      default_repo: "example-org/example-repo"

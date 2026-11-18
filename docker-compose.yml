@@ -1,0 +1,25 @@
+services:
+  agy-cloud:
+    build:
+      context: .
+      dockerfile: Dockerfile.controller
+    ports:
+      - "8080:8080"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - AGY_CLOUD_TOKEN=${AGY_CLOUD_TOKEN:-dev-local-token}
+    volumes:
+      - agy_cloud_state:/state
+      - ./config.example.yaml:/etc/agy-cloud/config.yaml:ro
+      - ./plugins:/app/plugins:ro
+    command:
+      - "serve"
+      - "--host=0.0.0.0"
+      - "--port=8080"
+      - "--state-dir=/state"
+      - "--plugins-dir=/app/plugins"
+      - "--config=/etc/agy-cloud/config.yaml"
+      - "--worker-runner=local"
+
+volumes:
+  agy_cloud_state:

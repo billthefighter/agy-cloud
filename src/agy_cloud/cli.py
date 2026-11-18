@@ -9,11 +9,12 @@ import uvicorn
 import yaml
 
 from agy_cloud.core.gateway import (
-    MemoryChannelBus,
-    RecordingWorkerJobService,
     create_microkernel_app,
 )
 from agy_cloud.core.loader import PluginRegistry
+from agy_cloud.core.transports import CompositeChannelBus
+from agy_cloud.core.workers import create_worker_job_service
+from agy_cloud.sdk.spec import AgyCloudConfig, WorkerRunnerConfig
 
 
 def scaffold_new_plugin(target_root: Path, plugin_id: str) -> Path:
@@ -106,9 +107,20 @@ async def _load_registry(
     state_dir: Path,
     plugins_dir: Path,
     config_file: Path | None = None,
+    worker_runner_mode: str = "",
 ) -> PluginRegistry:
-    bus = MemoryChannelBus()
-    jobs = RecordingWorkerJobService()
+    cluster_cfg = AgyCloudConfig()
+    if config_file is not None and config_file.is_file():
+        raw = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
+        if isinstance(raw, dict):
+            cluster_cfg = AgyCloudConfig.model_validate(raw)
+
+    runner_cfg = cluster_cfg.worker_runner
+    if worker_runner_mode:
+        runner_cfg = WorkerRunnerConfig(**{**runner_cfg.model_dump(), "mode": worker_runner_mode})
+
+    bus = CompositeChannelBus.from_configs(cluster_cfg.transports)
+    jobs = create_worker_job_service(runner_cfg, state_root=state_dir)
     registry = PluginRegistry(state_root=state_dir, channels=bus, jobs=jobs)
     if config_file is not None and config_file.is_file():
         await registry.load_from_config_file(
@@ -131,6 +143,12 @@ def main(argv: list[str] | None = None) -> int:
     p_serve.add_argument("--state-dir", default="/tmp/agy-cloud-state")
     p_serve.add_argument("--plugins-dir", default="./plugins")
     p_serve.add_argument("--config", default="", help="Path to cluster config.yaml (ConfigMap)")
+    p_serve.add_argument(
+        "--worker-runner",
+        default="",
+        choices=["", "recording", "local", "k8s"],
+        help="Override worker runner mode (`local` runs jobs as local subprocesses without K8s)",
+    )
     p_serve.add_argument("--api-token", default="")
     p_serve.add_argument("--base-path", default="")
 
@@ -160,7 +178,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.cmd == "serve":
         cfg_path = Path(args.config) if args.config else None
-        reg = asyncio.run(_load_registry(Path(args.state_dir), Path(args.plugins_dir), cfg_path))
+        reg = asyncio.run(
+            _load_registry(
+                Path(args.state_dir),
+                Path(args.plugins_dir),
+                cfg_path,
+                worker_runner_mode=args.worker_runner,
+            )
+        )
         app = create_microkernel_app(
             registry=reg,
             api_token=args.api_token,

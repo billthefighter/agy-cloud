@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-controller
+  labels:
+    app.kubernetes.io/name: {{ .Release.Name }}-controller
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Release.Name }}-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ .Release.Name }}-controller
+    spec:
+      containers:
+        - name: controller
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "serve"
+            - "--host=0.0.0.0"
+            - "--port={{ .Values.service.port }}"
+            - "--state-dir=/state"
+            - "--plugins-dir=/app/plugins"
+            - "--config=/etc/agy-cloud/config.yaml"
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.secretName }}
+                optional: true
+          volumeMounts:
+            - name: state
+              mountPath: /state
+            - name: config
+              mountPath: /etc/agy-cloud
+              readOnly: true
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-state
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-config

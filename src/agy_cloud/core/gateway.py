@@ -316,7 +316,8 @@ def create_microkernel_app(
 
     # Mount each plugin's custom APIRouter, isolated media dir, static dir, and standalone PWA views
     for pid, loaded in registry.plugins.items():
-        plugin_router = loaded.plugin.get_api_router()
+        granted = loaded.context.granted_permissions
+        plugin_router = loaded.plugin.get_api_router() if "api_router" in granted else None
         if plugin_router is not None:
             root_router.include_router(
                 plugin_router,
@@ -324,22 +325,24 @@ def create_microkernel_app(
                 tags=[f"plugin:{pid}"],
             )
 
-        def _make_media_handler(plugin_media_root: Path):
-            async def serve_plugin_media(relpath: str) -> Response:
-                resolved_root = plugin_media_root.resolve()
-                candidate = (resolved_root / relpath).resolve()
-                if not candidate.is_relative_to(resolved_root) or not candidate.is_file():
-                    raise HTTPException(status_code=404, detail="Plugin media file not found.")
-                return FileResponse(candidate)
+        if "media" in granted:
 
-            return serve_plugin_media
+            def _make_media_handler(plugin_media_root: Path):
+                async def serve_plugin_media(relpath: str) -> Response:
+                    resolved_root = plugin_media_root.resolve()
+                    candidate = (resolved_root / relpath).resolve()
+                    if not candidate.is_relative_to(resolved_root) or not candidate.is_file():
+                        raise HTTPException(status_code=404, detail="Plugin media file not found.")
+                    return FileResponse(candidate)
 
-        root_router.add_api_route(
-            f"/api/plugins/{pid}/media/{{relpath:path}}",
-            _make_media_handler(loaded.context.media_dir),
-            methods=["GET"],
-            tags=[f"plugin:{pid}"],
-        )
+                return serve_plugin_media
+
+            root_router.add_api_route(
+                f"/api/plugins/{pid}/media/{{relpath:path}}",
+                _make_media_handler(loaded.context.media_dir),
+                methods=["GET"],
+                tags=[f"plugin:{pid}"],
+            )
 
         if loaded.source_dir is not None and (loaded.source_dir / "static").is_dir():
             static_root = (loaded.source_dir / "static").resolve()
@@ -362,18 +365,19 @@ def create_microkernel_app(
                 tags=[f"plugin:{pid}"],
             )
 
-        for view in loaded.manifest.pwa_views:
-            if view.standalone_pwa and view.mount_path:
-                mount_p = "/" + view.mount_path.strip("/")
+        if "pwa_views" in granted:
+            for view in loaded.manifest.pwa_views:
+                if view.standalone_pwa and view.mount_path:
+                    mount_p = "/" + view.mount_path.strip("/")
 
-                def _make_view_handler(v: PwaViewSpec, p_id: str):
-                    async def serve_pwa_view() -> HTMLResponse:
-                        return HTMLResponse(_render_plugin_pwa_shell(v, p_id, clean_base))
+                    def _make_view_handler(v: PwaViewSpec, p_id: str):
+                        async def serve_pwa_view() -> HTMLResponse:
+                            return HTMLResponse(_render_plugin_pwa_shell(v, p_id, clean_base))
 
-                    return serve_pwa_view
+                        return serve_pwa_view
 
-                app.add_api_route(mount_p, _make_view_handler(view, pid), methods=["GET"])
-                app.add_api_route(f"{mount_p}/", _make_view_handler(view, pid), methods=["GET"])
+                    app.add_api_route(mount_p, _make_view_handler(view, pid), methods=["GET"])
+                    app.add_api_route(f"{mount_p}/", _make_view_handler(view, pid), methods=["GET"])
 
     app.include_router(root_router, prefix=clean_base)
     return app

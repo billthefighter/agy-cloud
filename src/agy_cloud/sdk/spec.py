@@ -3,12 +3,26 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, TypeVar
+from typing import Any, Protocol
 
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
-ConfigT = TypeVar("ConfigT", bound=BaseModel)
+ALL_PLUGIN_PERMISSIONS: frozenset[str] = frozenset(
+    {
+        "sqlite",
+        "media",
+        "channel_bus",
+        "k8s_jobs",
+        "services",
+        "api_router",
+        "pwa_views",
+    }
+)
+
+
+class PluginPermissionError(PermissionError):
+    """Raised when a plugin attempts to use a capability not granted in its permissions."""
 
 
 class DefaultPluginConfig(BaseModel):
@@ -48,6 +62,8 @@ class PluginManifest(BaseModel):
     entrypoint: str = ""
     dependencies: list[str] = Field(default_factory=list)
     optional_dependencies: list[str] = Field(default_factory=list)
+    python_dependencies: list[str] = Field(default_factory=list)
+    permissions: list[str] = Field(default_factory=lambda: sorted(ALL_PLUGIN_PERMISSIONS))
     default_config: dict[str, Any] = Field(default_factory=dict)
     channel_roles: list[ChannelRoleSpec] = Field(default_factory=list)
     push_categories: list[PushCategorySpec] = Field(default_factory=list)
@@ -62,13 +78,44 @@ class PluginRepoSource(BaseModel):
     ref: str = "main"
     subpath: str = ""
     auth_env: str = ""
+    allowed_permissions: list[str] | None = None
+    install_python_deps: bool = True
     config: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
+class TransportEntryConfig(BaseModel):
+    """Configuration for an outbound chat/notification transport (Discord, Telegram, Ntfy, Slack, Webhook)."""
+
+    kind: str  # "discord_webhook" | "telegram" | "ntfy" | "slack_webhook" | "webhook"
+    enabled: bool = True
+    url: str = ""
+    token: str = ""
+    chat_id: str = ""
+    topic: str = ""
+    roles: list[str] = Field(default_factory=list)
+
+
+class WorkerRunnerConfig(BaseModel):
+    """Configuration for how `ctx.jobs.spawn_agent_job` executes worker tasks."""
+
+    mode: str = "recording"  # "recording" | "local" | "k8s"
+    namespace: str = "agy-cloud"
+    worker_image: str = "ghcr.io/agy-cloud/agy-cloud-worker:latest"
+    worker_secret_name: str = "agy-cloud-worker-secret"
+    worker_service_account: str = "agy-cloud-worker"
+    state_pvc_name: str = "agy-cloud-state"
+    local_command: list[str] = Field(default_factory=list)
 
 
 class AgyCloudConfig(BaseModel):
     """Cluster-level configuration file (`config.yaml` / Kubernetes ConfigMap)."""
 
+    require_pinned_refs: bool = False
+    install_python_dependencies: bool = True
     plugin_sources: list[PluginRepoSource] = Field(default_factory=list)
+    plugin_permissions: dict[str, list[str]] = Field(default_factory=dict)
+    transports: list[TransportEntryConfig] = Field(default_factory=list)
+    worker_runner: WorkerRunnerConfig = Field(default_factory=WorkerRunnerConfig)
     plugins: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
@@ -319,7 +366,7 @@ def cron(
 
 
 class PluginContext[ConfigT: BaseModel]:
-    """Scoped runtime context injected into each plugin on load."""
+    """Scoped runtime context injected into each plugin on load with capability checks."""
 
     def __init__(
         self,
@@ -332,6 +379,7 @@ class PluginContext[ConfigT: BaseModel]:
         services: dict[str, Any],
         channels: ChannelBusProtocol,
         jobs: WorkerJobServiceProtocol,
+        granted_permissions: set[str] | None = None,
     ) -> None:
         self.plugin_id = plugin_id
         self.manifest = manifest
@@ -339,8 +387,30 @@ class PluginContext[ConfigT: BaseModel]:
         self.state_root = state_root
         self.plugin_source_dir = plugin_source_dir
         self._services = services
-        self.channels = channels
-        self.jobs = jobs
+        self._channels = channels
+        self._jobs = jobs
+        self.granted_permissions: set[str] = (
+            set(granted_permissions)
+            if granted_permissions is not None
+            else set(manifest.permissions)
+        )
+
+    def require_permission(self, permission: str) -> None:
+        if permission not in self.granted_permissions:
+            raise PluginPermissionError(
+                f"Plugin `{self.plugin_id}` does not have permission `{permission}` "
+                f"(granted: {sorted(self.granted_permissions)})."
+            )
+
+    @property
+    def channels(self) -> ChannelBusProtocol:
+        self.require_permission("channel_bus")
+        return self._channels
+
+    @property
+    def jobs(self) -> WorkerJobServiceProtocol:
+        self.require_permission("k8s_jobs")
+        return self._jobs
 
     @property
     def data_dir(self) -> Path:
@@ -350,19 +420,23 @@ class PluginContext[ConfigT: BaseModel]:
 
     @property
     def media_dir(self) -> Path:
+        self.require_permission("media")
         path = self.data_dir / "media"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
     def sqlite_path(self, filename: str = "store.sqlite3") -> Path:
+        self.require_permission("sqlite")
         return self.data_dir / filename
 
     def register_service(self, name: str, service: Any) -> None:
         """Publish an in-process service (e.g. 'garmin') for sibling plugins."""
+        self.require_permission("services")
         self._services[name] = service
 
     def get_service(self, name: str) -> Any | None:
         """Look up an optional sibling plugin service by name."""
+        self.require_permission("services")
         return self._services.get(name)
 
 

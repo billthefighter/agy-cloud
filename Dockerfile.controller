@@ -1,0 +1,25 @@
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+WORKDIR /app
+COPY pyproject.toml README.md ./
+COPY src ./src
+COPY plugins ./plugins
+COPY skills ./skills
+
+RUN uv pip install --system --no-cache ".[k8s,slack]" \
+    && useradd -m -u 1000 agy \
+    && mkdir -p /state \
+    && chown -R agy:agy /app /state
+
+USER 1000:1000
+EXPOSE 8080
+ENTRYPOINT ["agy-cloud"]
+CMD ["serve", "--host=0.0.0.0", "--port=8080", "--state-dir=/state", "--plugins-dir=/app/plugins", "--config=/etc/agy-cloud/config.yaml"]

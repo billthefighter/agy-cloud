@@ -19,6 +19,7 @@ import structlog
 import yaml
 
 from agy_cloud.sdk.spec import (
+    ALL_PLUGIN_PERMISSIONS,
     AgyCloudConfig,
     AgyCloudPlugin,
     ButtonActionRegistration,
@@ -41,6 +42,12 @@ log = structlog.get_logger(__name__)
 
 ENTRYPOINT_GROUP = "agy_cloud.plugins"
 _ENV_PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+_PINNED_REF_RE = re.compile(r"^([0-9a-fA-F]{7,40}|v?\d+\.\d+\.\d+[-A-Za-z0-9.]*)$")
+
+
+def is_pinned_git_ref(ref: str) -> bool:
+    """Return True if `ref` is an immutable commit SHA or semver release tag (`v1.2.3`)."""
+    return bool(_PINNED_REF_RE.fullmatch(ref.strip()))
 
 
 @dataclass(slots=True)
@@ -49,6 +56,8 @@ class DiscoveredPluginSpec:
     cls: type[AgyCloudPlugin[Any]]
     source_dir: Path | None = None
     bundled_config: dict[str, Any] = field(default_factory=dict)
+    allowed_permissions: set[str] | None = None
+    install_python_deps: bool = True
 
 
 @dataclass(slots=True)
@@ -104,13 +113,81 @@ def extract_env_plugin_overrides(
         if k.startswith(prefix):
             field_name = k[len(prefix) :].lower()
             if field_name:
-                # Parse YAML scalars (bool, int, float, str) safely
                 overrides[field_name] = yaml.safe_load(raw_val)
     return overrides
 
 
-def sync_plugin_repo(source: PluginRepoSource, repos_cache_dir: Path) -> Path:
+def collect_plugin_python_requirements(
+    plugin_dir: Path | None, manifest: PluginManifest
+) -> list[str]:
+    """Collect PyPI package specs from `manifest.python_dependencies` and `<plugin_dir>/requirements.txt`."""
+    reqs: list[str] = [d.strip() for d in manifest.python_dependencies if d.strip()]
+    if plugin_dir is not None:
+        req_file = plugin_dir / "requirements.txt"
+        if req_file.is_file():
+            for raw_line in req_file.read_text(encoding="utf-8").splitlines():
+                line = raw_line.split("#", 1)[0].strip()
+                if line and not line.startswith("-"):
+                    reqs.append(line)
+    return reqs
+
+
+def install_plugin_python_dependencies(
+    requirements: list[str],
+    target_site_packages: Path,
+    *,
+    installer_runner: Any | None = None,
+) -> list[str]:
+    """Bootstrap per-plugin Python dependencies into `target_site_packages` and prepend to `sys.path`."""
+    if not requirements:
+        return []
+    target_site_packages.mkdir(parents=True, exist_ok=True)
+    site_str = str(target_site_packages.resolve())
+    if site_str not in sys.path:
+        sys.path.insert(0, site_str)
+
+    uv_bin = shutil.which("uv")
+    if uv_bin:
+        cmd = [
+            uv_bin,
+            "pip",
+            "install",
+            "--python",
+            sys.executable,
+            "--target",
+            site_str,
+            *requirements,
+        ]
+    else:
+        cmd = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--target",
+            site_str,
+            *requirements,
+        ]
+
+    runner = installer_runner or subprocess.run
+    log.info("plugin_deps.installing", requirements=requirements, target=site_str)
+    runner(cmd, check=True, capture_output=True, text=True)
+    return requirements
+
+
+def sync_plugin_repo(
+    source: PluginRepoSource,
+    repos_cache_dir: Path,
+    *,
+    require_pinned_ref: bool = False,
+) -> Path:
     """Clone or update a plugin Git repository without persisting tokens into `.git/config`."""
+    if require_pinned_ref and not is_pinned_git_ref(source.ref):
+        raise ValueError(
+            f"Plugin repo `{source.repo}` uses unpinned ref `{source.ref}`, "
+            "but `require_pinned_refs=True` requires a commit SHA or semver tag (e.g. `v0.1.0`)."
+        )
+
     repos_cache_dir.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha1(source.repo.encode("utf-8")).hexdigest()[:10]
     safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(source.repo).stem) or "plugin_repo"
@@ -139,7 +216,6 @@ def sync_plugin_repo(source: PluginRepoSource, repos_cache_dir: Path) -> Path:
             text=True,
         )
 
-    # Checkout requested branch, tag, or exact commit SHA
     checkout_proc = subprocess.run(
         ["git", "-C", str(checkout_dir), "checkout", source.ref],
         check=False,
@@ -249,12 +325,15 @@ class PluginRegistry:
         state_root: Path,
         channels: ChannelBusProtocol,
         jobs: WorkerJobServiceProtocol,
+        pip_installer_runner: Any | None = None,
     ) -> None:
         self.state_root = state_root
         self.channels = channels
         self.jobs = jobs
+        self._pip_installer_runner = pip_installer_runner
         self.services: dict[str, Any] = {}
         self.plugins: dict[str, LoadedPlugin] = {}
+        self.installed_python_packages: dict[str, list[str]] = {}
 
         self._commands: dict[str, tuple[LoadedPlugin, CommandRegistration]] = {}
         self._channel_listeners: dict[
@@ -263,23 +342,35 @@ class PluginRegistry:
         self._thread_replies: dict[str, tuple[LoadedPlugin, ThreadReplyRegistration]] = {}
         self._button_actions: list[tuple[str, LoadedPlugin, ButtonActionRegistration]] = []
 
+    @property
+    def plugin_site_packages_dir(self) -> Path:
+        return self.state_root / "plugin_site_packages"
+
     def _load_single_plugin_dir(
         self,
         plugin_dir: Path,
         *,
         repo_plugins_cfg: dict[str, dict[str, Any]] | None = None,
         source_overrides: dict[str, dict[str, Any]] | None = None,
+        allowed_permissions: set[str] | None = None,
+        install_python_deps: bool = True,
     ) -> DiscoveredPluginSpec:
         manifest_file = plugin_dir / "plugin.yaml"
         raw = _load_optional_yaml_dict(manifest_file)
         manifest = PluginManifest.model_validate(raw)
+
+        if install_python_deps:
+            reqs = collect_plugin_python_requirements(plugin_dir, manifest)
+            if reqs:
+                installed = install_plugin_python_dependencies(
+                    reqs,
+                    self.plugin_site_packages_dir,
+                    installer_runner=self._pip_installer_runner,
+                )
+                self.installed_python_packages[manifest.id] = installed
+
         cls = _import_plugin_class_from_dir(plugin_dir, manifest.entrypoint)
 
-        # Merge bundled config layers:
-        # 1. plugin.yaml -> default_config
-        # 2. <plugin_dir>/config.yaml
-        # 3. <repo_root>/config.yaml -> plugins.<id>
-        # 4. plugin_sources[].config.<id>
         bundled: dict[str, Any] = dict(manifest.default_config)
         local_cfg = _load_optional_yaml_dict(plugin_dir / "config.yaml")
         if local_cfg:
@@ -294,6 +385,8 @@ class PluginRegistry:
             cls=cls,
             source_dir=plugin_dir,
             bundled_config=bundled,
+            allowed_permissions=allowed_permissions,
+            install_python_deps=install_python_deps,
         )
 
     def discover_directory(
@@ -301,6 +394,8 @@ class PluginRegistry:
         root_dir: Path,
         *,
         source_overrides: dict[str, dict[str, Any]] | None = None,
+        allowed_permissions: set[str] | None = None,
+        install_python_deps: bool = True,
     ) -> dict[str, DiscoveredPluginSpec]:
         """Discover either a single-plugin root (`plugin.yaml`) or a multi-plugin tree."""
         found: dict[str, DiscoveredPluginSpec] = {}
@@ -312,17 +407,17 @@ class PluginRegistry:
         if isinstance(repo_cfg.get("plugins"), dict):
             repo_plugins_cfg = repo_cfg["plugins"]
 
-        # Case 1: Single-plugin repo/directory (`root_dir/plugin.yaml` exists)
         if (root_dir / "plugin.yaml").is_file():
             spec = self._load_single_plugin_dir(
                 root_dir,
                 repo_plugins_cfg=repo_plugins_cfg,
                 source_overrides=source_overrides,
+                allowed_permissions=allowed_permissions,
+                install_python_deps=install_python_deps,
             )
             found[spec.manifest.id] = spec
             return found
 
-        # Case 2: Multi-plugin directory (`root_dir/<child>/plugin.yaml` or `root_dir/plugins/<child>/plugin.yaml`)
         search_roots = [root_dir]
         if (root_dir / "plugins").is_dir():
             search_roots.append(root_dir / "plugins")
@@ -334,6 +429,8 @@ class PluginRegistry:
                         child,
                         repo_plugins_cfg=repo_plugins_cfg,
                         source_overrides=source_overrides,
+                        allowed_permissions=allowed_permissions,
+                        install_python_deps=install_python_deps,
                     )
                     found[spec.manifest.id] = spec
         return found
@@ -343,16 +440,30 @@ class PluginRegistry:
         sources: list[PluginRepoSource],
         *,
         repos_cache_dir: Path | None = None,
+        require_pinned_refs: bool = False,
+        install_python_deps: bool = True,
     ) -> dict[str, DiscoveredPluginSpec]:
         """Clone/sync external plugin Git repositories and discover their plugins + bundled config."""
         cache_root = repos_cache_dir or (self.state_root / "plugin_repos")
         found: dict[str, DiscoveredPluginSpec] = {}
         for src in sources:
-            checkout_dir = sync_plugin_repo(src, cache_root)
+            checkout_dir = sync_plugin_repo(
+                src,
+                cache_root,
+                require_pinned_ref=require_pinned_refs,
+            )
             target_dir = (checkout_dir / src.subpath).resolve() if src.subpath else checkout_dir
             if not target_dir.is_relative_to(checkout_dir.resolve()):
                 raise ValueError(f"Invalid plugin repo subpath `{src.subpath}`.")
-            discovered = self.discover_directory(target_dir, source_overrides=src.config)
+            src_allowed = (
+                set(src.allowed_permissions) if src.allowed_permissions is not None else None
+            )
+            discovered = self.discover_directory(
+                target_dir,
+                source_overrides=src.config,
+                allowed_permissions=src_allowed,
+                install_python_deps=install_python_deps and src.install_python_deps,
+            )
             found.update(discovered)
         return found
 
@@ -399,6 +510,9 @@ class PluginRegistry:
             plugin_sources=cluster_cfg.plugin_sources,
             include_entrypoints=include_entrypoints,
             plugin_configs=cluster_cfg.plugins,
+            plugin_permissions=cluster_cfg.plugin_permissions,
+            require_pinned_refs=cluster_cfg.require_pinned_refs,
+            install_python_deps=cluster_cfg.install_python_dependencies,
         )
 
     async def load_all(
@@ -409,17 +523,32 @@ class PluginRegistry:
         include_entrypoints: bool = True,
         entrypoint_filter: set[str] | None = None,
         plugin_configs: dict[str, dict[str, Any]] | None = None,
+        plugin_permissions: dict[str, list[str]] | None = None,
+        require_pinned_refs: bool = False,
+        install_python_deps: bool = True,
     ) -> list[LoadedPlugin]:
         discovered: dict[str, DiscoveredPluginSpec] = {}
         if include_entrypoints:
             discovered.update(self.discover_entrypoints(only_ids=entrypoint_filter))
         if plugin_sources:
-            discovered.update(self.discover_git_sources(plugin_sources))
+            discovered.update(
+                self.discover_git_sources(
+                    plugin_sources,
+                    require_pinned_refs=require_pinned_refs,
+                    install_python_deps=install_python_deps,
+                )
+            )
         if plugins_dir is not None:
-            discovered.update(self.discover_directory(plugins_dir))
+            discovered.update(
+                self.discover_directory(
+                    plugins_dir,
+                    install_python_deps=install_python_deps,
+                )
+            )
 
         ordered = _topological_sort_plugins(discovered)
         cluster_cfgs = plugin_configs or {}
+        cluster_perms = plugin_permissions or {}
         loaded_list: list[LoadedPlugin] = []
 
         for spec in ordered:
@@ -427,23 +556,25 @@ class PluginRegistry:
             cls = spec.cls
             src_dir = spec.source_dir
 
-            # 4-Layer Config Resolution:
-            # Layer 1+2+3: Bundled plugin/repo config + source config
             merged_cfg = dict(spec.bundled_config)
-            # Layer 4a: Cluster ConfigMap override (`config.yaml -> plugins.<id>`)
             if isinstance(cluster_cfgs.get(manifest.id), dict):
                 merged_cfg = deep_merge_dicts(merged_cfg, cluster_cfgs[manifest.id])
-            # Layer 4b: Environment variable overrides (`AGY_PLUGIN_<ID>_<KEY>`)
             env_overrides = extract_env_plugin_overrides(manifest.id)
             if env_overrides:
                 merged_cfg = deep_merge_dicts(merged_cfg, env_overrides)
-            # Expand `${ENV_VAR:-default}` placeholders across all resolved values
             resolved_cfg = expand_env_placeholders(merged_cfg)
 
             cfg_obj = cls.config_model.model_validate(resolved_cfg)
             if hasattr(cfg_obj, "enabled") and not bool(cfg_obj.enabled):
                 log.info("plugin.disabled_by_config", plugin_id=manifest.id)
                 continue
+
+            # Compute effective granted permissions (manifest ∩ source cap ∩ cluster ConfigMap cap)
+            granted = set(manifest.permissions) & set(ALL_PLUGIN_PERMISSIONS)
+            if spec.allowed_permissions is not None:
+                granted &= spec.allowed_permissions
+            if manifest.id in cluster_perms:
+                granted &= set(cluster_perms[manifest.id])
 
             plugin_instance = cls(manifest=manifest)
             ctx: PluginContext[Any] = PluginContext(
@@ -455,6 +586,7 @@ class PluginRegistry:
                 services=self.services,
                 channels=self.channels,
                 jobs=self.jobs,
+                granted_permissions=granted,
             )
             await plugin_instance.on_load(ctx)
             loaded = self._index_plugin(manifest, plugin_instance, ctx, src_dir)
@@ -464,6 +596,7 @@ class PluginRegistry:
                 "plugin.loaded",
                 plugin_id=manifest.id,
                 version=manifest.version,
+                permissions=sorted(granted),
                 commands=[c.name for c in loaded.commands],
                 roles=[r.role for r in manifest.channel_roles],
                 pwa_views=[v.mount_path for v in manifest.pwa_views],
