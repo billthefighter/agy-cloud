@@ -73,7 +73,20 @@ def migrate_agent_tasks_pvc(
 
         # 2. Migrate nutrition.sqlite3 -> /state/plugins/health/nutrition.sqlite3
         health_db = state_dir / "plugins" / "health" / "nutrition.sqlite3"
-        if not health_db.is_file():
+        should_copy_nutrition = not health_db.is_file()
+        if not should_copy_nutrition:
+            try:
+                with (
+                    sqlite3.connect(legacy_nutrition_db, timeout=15.0) as lconn,
+                    sqlite3.connect(health_db, timeout=15.0) as hconn,
+                ):
+                    l_cnt = lconn.execute("SELECT COUNT(*) FROM meal_entries").fetchone()[0]
+                    h_cnt = hconn.execute("SELECT COUNT(*) FROM meal_entries").fetchone()[0]
+                    if int(l_cnt) > int(h_cnt):
+                        should_copy_nutrition = True
+            except sqlite3.Error:
+                pass
+        if should_copy_nutrition:
             sqlite_online_backup(legacy_nutrition_db, health_db)
             report.nutrition_db_migrated = True
 
