@@ -721,3 +721,22 @@ class PluginRegistry:
                     shutil.copytree(skill_dir, dest)
                     exported.append(dest)
         return exported
+
+    def backup_all_plugin_databases(
+        self,
+        *,
+        retain: int = 14,
+        timestamp_slug: str | None = None,
+    ) -> dict[str, list[str]]:
+        """Run WAL-safe online `.sqlite3.gz` backups for all loaded plugins with `sqlite` permission."""
+        results: dict[str, list[str]] = {}
+        for pid, loaded in self.plugins.items():
+            if "sqlite" not in loaded.context.granted_permissions:
+                continue
+            written = loaded.context.backup_databases(
+                retain=retain,
+                timestamp_slug=timestamp_slug,
+            )
+            if written:
+                results[pid] = [str(p) for p in written]
+        return results

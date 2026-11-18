@@ -8,6 +8,8 @@ from typing import Any, Protocol
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
+from agy_cloud.sdk.persistence import PluginDatabase, PluginKeyValueStore
+
 ALL_PLUGIN_PERMISSIONS: frozenset[str] = frozenset(
     {
         "sqlite",
@@ -394,6 +396,9 @@ class PluginContext[ConfigT: BaseModel]:
             if granted_permissions is not None
             else set(manifest.permissions)
         )
+        self._databases: dict[str, PluginDatabase] = {}
+        self._registered_db_paths: set[Path] = set()
+        self._kv: PluginKeyValueStore | None = None
 
     def require_permission(self, permission: str) -> None:
         if permission not in self.granted_permissions:
@@ -427,7 +432,54 @@ class PluginContext[ConfigT: BaseModel]:
 
     def sqlite_path(self, filename: str = "store.sqlite3") -> Path:
         self.require_permission("sqlite")
-        return self.data_dir / filename
+        path = self.data_dir / filename
+        self._registered_db_paths.add(path)
+        return path
+
+    def db(self, filename: str = "store.sqlite3") -> PluginDatabase:
+        """Return a Core-managed WAL SQLite `PluginDatabase` with migrations and online backups."""
+        self.require_permission("sqlite")
+        if filename not in self._databases:
+            path = self.sqlite_path(filename)
+            self._databases[filename] = PluginDatabase(
+                path,
+                plugin_id=self.plugin_id,
+                state_root=self.state_root,
+            )
+        return self._databases[filename]
+
+    @property
+    def kv(self) -> PluginKeyValueStore:
+        """Return a Core-managed zero-SQL JSON key-value store scoped to this plugin."""
+        self.require_permission("sqlite")
+        if self._kv is None:
+            self._kv = PluginKeyValueStore(self.db("store.sqlite3"))
+        return self._kv
+
+    def backup_databases(
+        self,
+        *,
+        retain: int = 14,
+        timestamp_slug: str | None = None,
+    ) -> list[Path]:
+        """Run WAL-safe online `.sqlite3.gz` backups for all SQLite DBs owned by this plugin."""
+        self.require_permission("sqlite")
+        all_paths = set(self._registered_db_paths)
+        if (self.state_root / "plugins" / self.plugin_id).is_dir():
+            for disk_db in (self.state_root / "plugins" / self.plugin_id).glob("*.sqlite3"):
+                all_paths.add(disk_db)
+
+        backups: list[Path] = []
+        for db_path in sorted(all_paths):
+            if not db_path.is_file():
+                continue
+            helper = self._databases.get(db_path.name) or PluginDatabase(
+                db_path,
+                plugin_id=self.plugin_id,
+                state_root=self.state_root,
+            )
+            backups.append(helper.backup_compressed(retain=retain, timestamp_slug=timestamp_slug))
+        return backups
 
     def register_service(self, name: str, service: Any) -> None:
         """Publish an in-process service (e.g. 'garmin') for sibling plugins."""

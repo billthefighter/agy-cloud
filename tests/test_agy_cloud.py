@@ -653,3 +653,58 @@ async def test_non_destructive_agent_tasks_pvc_migration(
     assert h_resp.status_code == 200
     assert h_resp.json()["short_id"] == "HANDOFF-LEGACY"
     assert "diff --git" in h_resp.json()["patch"]
+
+
+async def test_core_managed_plugin_kv_db_migrations_and_backups(
+    tmp_path: Path,
+    repo_root: Path,
+) -> None:
+    bus = MemoryChannelBus()
+    jobs = RecordingWorkerJobService()
+    registry = PluginRegistry(state_root=tmp_path / "state", channels=bus, jobs=jobs)
+    await registry.load_all(plugins_dir=repo_root / "plugins", include_entrypoints=False)
+
+    ctx = registry.plugins["repo_healer"].context
+
+    # 1. Zero-SQL Key-Value store (`ctx.kv`)
+    assert ctx.kv.get("missing", default=123) == 123
+    ctx.kv.set("cursor:main", {"sha": "abc1234", "count": 5})
+    ctx.kv.set("cursor:dev", {"sha": "def5678", "count": 2})
+    assert ctx.kv.get("cursor:main") == {"sha": "abc1234", "count": 5}
+    assert ctx.kv.list_keys(prefix="cursor:") == ["cursor:dev", "cursor:main"]
+    assert len(ctx.kv.get_all(prefix="cursor:")) == 2
+    assert ctx.kv.delete("cursor:dev") is True
+    assert ctx.kv.get("cursor:dev") is None
+
+    # 2. Core-managed relational SQLite (`ctx.db`) with versioned migrations
+    db = ctx.db("healer.sqlite3")
+    migrations = {
+        1: """
+            CREATE TABLE runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo TEXT NOT NULL
+            );
+        """,
+        2: "ALTER TABLE runs ADD COLUMN passed INTEGER NOT NULL DEFAULT 1;",
+    }
+    first_applied = db.migrate(migrations)
+    assert first_applied == [1, 2]
+    # Second call is idempotent
+    assert db.migrate(migrations) == []
+    assert db.applied_migrations() == [1, 2]
+
+    db.execute("INSERT INTO runs (repo, passed) VALUES (?, ?)", ("example-org/app", 1))
+    row = db.fetchone("SELECT repo, passed FROM runs WHERE id = ?", (1,))
+    assert row == {"repo": "example-org/app", "passed": 1}
+
+    # 3. Fleet-wide WAL-safe online `.sqlite3.gz` backup endpoint (`POST /api/plugins/backup`)
+    app = create_microkernel_app(registry=registry)
+    client = TestClient(app)
+    bk_resp = client.post("/api/plugins/backup?retain=5")
+    assert bk_resp.status_code == 200
+    backups = bk_resp.json()["backups"]
+    assert "repo_healer" in backups
+    assert len(backups["repo_healer"]) == 2  # store.sqlite3 + healer.sqlite3
+    for gz_path in backups["repo_healer"]:
+        assert Path(gz_path).is_file()
+        assert gz_path.endswith(".sqlite3.gz")

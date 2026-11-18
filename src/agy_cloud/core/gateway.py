@@ -249,6 +249,11 @@ def create_microkernel_app(
             "services": sorted(registry.services.keys()),
         }
 
+    @root_router.post("/api/plugins/backup")
+    async def backup_all_plugins(retain: int = 14) -> dict[str, Any]:
+        backups = registry.backup_all_plugin_databases(retain=retain)
+        return {"ok": True, "backups": backups}
+
     # Unified Channel Bus Dispatch Endpoints
     @root_router.post("/api/bus/command")
     async def bus_dispatch_command(body: _BusCommandRequest) -> dict[str, Any]:

@@ -172,3 +172,59 @@ class HealthPlugin(AgyCloudPlugin[HealthConfig]):
 
         return router
 ```
+
+---
+
+## 5. Persistence Architecture: Core State vs. Plugin Persistence (`ctx.kv` & `ctx.db`)
+
+Persistence in `agy-cloud` is organized into **three tiers** so plugin authors never have to write low-level SQLite WAL/connection/backup boilerplate unless they want custom relational queries:
+
+### Tier 1 — Core Platform Persistence (Automatic, Zero Plugin Code)
+The microkernel Core owns and persists all cross-cutting platform state on `/state`:
+- **Handoffs & Worker Jobs** (`/state/handoffs.sqlite3`, `/state/artifacts/<id>/`, `/state/sessions/<id>/`): Every `/handoff` session, `JobSpec`, `TriageReport`, cumulative `fix.patch`, and `google-antigravity` SDK `save_dir` conversation trajectory.
+- **Threads, Messages, & Mobile PWA State** (`/state/state.sqlite3`): Every Slack/PWA thread, message, Web Push subscription, channel binding, follow-up timer, and monthly AI credit ledger entry.
+- **Persistent Agent Memory** (`/state/memory/`): Standing instructions and repository notes.
+
+### Tier 2 — Core-Managed Zero-SQL Key-Value Store (`ctx.kv`)
+For plugins that need to persist cursors, timestamps, OAuth tokens, or JSON documents without designing a relational schema, `ctx.kv` provides a zero-SQL JSON store backed by a Core-managed WAL SQLite table in `/state/plugins/<plugin_id>/store.sqlite3`:
+
+```python
+# Save arbitrary JSON-serializable state
+self.ctx.kv.set("last_sync", {"cursor": "abc-123", "count": 42})
+
+# Read with default fallback
+state = self.ctx.kv.get("last_sync", default={"cursor": None})
+
+# Prefix listing & bulk retrieval
+keys = self.ctx.kv.list_keys(prefix="user:")
+```
+
+### Tier 3 — Core-Managed Relational SQLite (`ctx.db()` & `ctx.sqlite_path()`)
+When a plugin needs relational SQLite tables (such as `health` or `garmin`), `ctx.db(filename="store.sqlite3")` returns a Core-managed `PluginDatabase` pre-configured with `PRAGMA journal_mode=WAL`, `PRAGMA synchronous=NORMAL`, `PRAGMA foreign_keys=ON`, `PRAGMA busy_timeout=30000`, `sqlite3.Row`, idempotent schema migrations, and automatic inclusion in `POST /api/plugins/backup` (`.sqlite3.gz` online snapshots):
+
+```python
+db = self.ctx.db("nutrition.sqlite3")
+
+# 1. Idempotent versioned schema migrations (tracked in `_agy_schema_migrations`)
+db.migrate(
+    {
+        1: """
+        CREATE TABLE IF NOT EXISTS meals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            calories_kcal INTEGER NOT NULL
+        );
+    """,
+        2: "ALTER TABLE meals ADD COLUMN notes TEXT NOT NULL DEFAULT '';",
+    }
+)
+
+# 2. Parameterized queries with automatic WAL transaction handling
+db.execute("INSERT INTO meals (title, calories_kcal) VALUES (?, ?)", ("Salmon Bowl", 680))
+rows = db.fetchall("SELECT * FROM meals WHERE calories_kcal > ?", (400,))
+
+# 3. WAL-safe online compressed backup (`/state/backups/plugins/<id>/nutrition-<ts>.sqlite3.gz`)
+snapshot_path = db.backup_compressed(retain=14)
+```
+*(Advanced plugins with custom store classes can still call `self.ctx.sqlite_path("nutrition.sqlite3")`, which registers the file with the Core's online backup service while returning the raw `Path`.)*
+

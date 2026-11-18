@@ -319,3 +319,11 @@ This generates:
 - `plugins/strava/plugin.json` & `plugins/strava/skills/strava/SKILL.md` — Client-side Antigravity skill exportable via `agy-cloud plugins install-skills`.
 
 See **[`docs/PLUGIN_SPEC.md`](docs/PLUGIN_SPEC.md)** for the complete v1 Plugin SDK reference.
+
+### Persistence Layers (Core vs. Plugins)
+
+| Layer | Who Owns Schema & Connections? | Location on PVC (`/state`) | When to Use |
+|---|---|---|---|
+| **1. Core Platform State** | **Core** (`StateStore`, `HandoffStore`, `MemoryStore`) | `/state/state.sqlite3`, `/state/handoffs.sqlite3`, `/state/sessions/`, `/state/artifacts/` | Automatic for all `/handoff` tasks, K8s worker Jobs, Slack/PWA threads, Web Push subscriptions, timers, and billing usage. |
+| **2. Scoped Key-Value Store (`ctx.kv`)** | **Core** (`PluginKeyValueStore`) | `/state/plugins/<plugin_id>/store.sqlite3` (`_agy_plugin_kv`) | Zero-SQL persistence (`ctx.kv.get(key)`, `ctx.kv.set(key, obj)`) for cursors, settings, and JSON documents. |
+| **3. Scoped Relational SQLite (`ctx.db()`)** | **Core manages WAL, migrations, & `.sqlite3.gz` backups**; **Plugin defines SQL tables** | `/state/plugins/<plugin_id>/<name>.sqlite3` & `/state/backups/plugins/<plugin_id>/` | Domain tables (`ctx.db("nutrition.sqlite3").migrate({1: "CREATE TABLE ..."})`) with automatic `WAL` mode, `foreign_keys=ON`, `busy_timeout=30000`, and `POST /api/plugins/backup` online snapshots. |

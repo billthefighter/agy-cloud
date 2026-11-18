@@ -1,3 +1,4 @@
+from agy_cloud.sdk.persistence import PluginDatabase, PluginKeyValueStore
 from agy_cloud.sdk.spec import (
     ALL_PLUGIN_PERMISSIONS,
     AgyCloudConfig,
@@ -51,6 +52,8 @@ __all__ = [
     "JobSpec",
     "MediaAttachment",
     "PluginContext",
+    "PluginDatabase",
+    "PluginKeyValueStore",
     "PluginManifest",
     "PluginPermissionError",
     "PluginRepoSource",
