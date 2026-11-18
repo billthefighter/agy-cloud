@@ -314,6 +314,19 @@ def create_microkernel_app(
             )
         return {"ok": True, "reply": reply}
 
+    # Legacy `/api/media/{relpath:path}` compatibility route for existing `agent-tasks` PVC photos
+    @root_router.get("/api/media/{relpath:path}")
+    async def serve_legacy_pvc_media(relpath: str) -> Response:
+        state_root = registry.state_root.resolve()
+        allowed_roots = [
+            (state_root / "food_photos").resolve(),
+            (state_root / "pwa_uploads").resolve(),
+        ]
+        candidate = (state_root / relpath).resolve()
+        if not any(candidate.is_relative_to(r) for r in allowed_roots) or not candidate.is_file():
+            raise HTTPException(status_code=404, detail="Media file not found.")
+        return FileResponse(candidate)
+
     # Mount each plugin's custom APIRouter, isolated media dir, static dir, and standalone PWA views
     for pid, loaded in registry.plugins.items():
         granted = loaded.context.granted_permissions
@@ -329,9 +342,18 @@ def create_microkernel_app(
 
             def _make_media_handler(plugin_media_root: Path):
                 async def serve_plugin_media(relpath: str) -> Response:
+                    if ".." in Path(relpath).parts:
+                        raise HTTPException(status_code=404, detail="Plugin media file not found.")
                     resolved_root = plugin_media_root.resolve()
-                    candidate = (resolved_root / relpath).resolve()
-                    if not candidate.is_relative_to(resolved_root) or not candidate.is_file():
+                    resolved_state = registry.state_root.resolve()
+                    candidate = (plugin_media_root / relpath).resolve()
+                    if (
+                        not (
+                            candidate.is_relative_to(resolved_root)
+                            or candidate.is_relative_to(resolved_state)
+                        )
+                        or not candidate.is_file()
+                    ):
                         raise HTTPException(status_code=404, detail="Plugin media file not found.")
                     return FileResponse(candidate)
 

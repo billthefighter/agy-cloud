@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from agy_cloud.core.gateway import (
     create_microkernel_app,
 )
 from agy_cloud.core.loader import PluginRegistry, is_pinned_git_ref
+from agy_cloud.core.migration import migrate_agent_tasks_pvc
 from agy_cloud.core.transports import CompositeChannelBus, OutboundHttpTransport
 from agy_cloud.core.workers import (
     LocalSubprocessWorkerJobService,
@@ -489,3 +491,165 @@ async def test_pluggable_notification_transports_and_local_worker_runner(
     k8s_manifest = build_k8s_worker_job_dict(job_spec, runner_cfg)
     assert k8s_manifest["kind"] == "Job"
     assert k8s_manifest["spec"]["template"]["spec"]["automountServiceAccountToken"] is False
+
+
+async def test_non_destructive_agent_tasks_pvc_migration(
+    tmp_path: Path,
+    external_health_plugins_repo: Path,
+) -> None:
+    """Verify migrating an existing `agent-tasks-state` PVC in-place with zero data loss."""
+    pvc_dir = tmp_path / "agent_tasks_pvc"
+    pvc_dir.mkdir()
+
+    # 1. Seed legacy `/state/state.sqlite3` (WAL mode) with an active coding/handoff task
+    with sqlite3.connect(pvc_dir / "state.sqlite3") as sconn:
+        sconn.execute("PRAGMA journal_mode=WAL;")
+        sconn.execute(
+            """
+            CREATE TABLE issues (
+                issue_id TEXT PRIMARY KEY,
+                short_id TEXT NOT NULL,
+                project_slug TEXT NOT NULL,
+                github_repo TEXT NOT NULL,
+                default_branch TEXT NOT NULL,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL,
+                turn INTEGER NOT NULL,
+                conversation_id TEXT,
+                base_ref TEXT,
+                model_override TEXT,
+                last_error TEXT,
+                updated_at TEXT NOT NULL,
+                task_kind TEXT NOT NULL
+            );
+            """
+        )
+        sconn.execute(
+            """
+            INSERT INTO issues VALUES (
+                'handoff-legacy-1', 'HANDOFF-LEGACY', 'repo', 'example-org/repo',
+                'main', 'Continue refactor on pod', 'awaiting_review', 2,
+                'conv-legacy-2', 'abc1234', 'gemini-4-hydrogen', NULL,
+                '2026-11-18T10:00:00Z', 'handoff'
+            );
+            """
+        )
+    art_dir = pvc_dir / "artifacts" / "handoff-legacy-1"
+    art_dir.mkdir(parents=True)
+    (art_dir / "fix.patch").write_text("diff --git a/x.py b/x.py\n", encoding="utf-8")
+
+    # 2. Seed legacy `/state/nutrition.sqlite3` (WAL mode) with meal_entries, body_metrics, and garmin_daily_metrics
+    with sqlite3.connect(pvc_dir / "nutrition.sqlite3") as nconn:
+        nconn.execute("PRAGMA journal_mode=WAL;")
+        nconn.execute(
+            """
+            CREATE TABLE meal_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                logged_at TEXT NOT NULL,
+                local_date TEXT NOT NULL,
+                meal_slot TEXT NOT NULL,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'confirmed',
+                photo_relpath TEXT,
+                slack_thread_ts TEXT,
+                scale_factor REAL NOT NULL DEFAULT 1.0,
+                total_calories_kcal REAL NOT NULL,
+                total_protein_g REAL NOT NULL,
+                total_carbs_g REAL NOT NULL,
+                total_fat_g REAL NOT NULL,
+                total_fiber_g REAL NOT NULL DEFAULT 0
+            );
+            """
+        )
+        nconn.execute(
+            """
+            INSERT INTO meal_entries (
+                id, logged_at, local_date, meal_slot, title, status,
+                photo_relpath, slack_thread_ts, scale_factor,
+                total_calories_kcal, total_protein_g, total_carbs_g, total_fat_g, total_fiber_g
+            ) VALUES (
+                1, '2026-11-18T08:00:00Z', '2026-11-18', 'breakfast',
+                'Steak & Eggs', 'confirmed', 'food_photos/2026-11/meal-1.webp',
+                '170000.001', 1.0, 650.0, 52.0, 4.0, 46.0, 0.0
+            );
+            """
+        )
+        nconn.execute(
+            """
+            CREATE TABLE body_metrics (
+                local_date TEXT PRIMARY KEY,
+                weight_lbs REAL NOT NULL,
+                ema_weight_lbs REAL NOT NULL,
+                notes TEXT,
+                logged_at TEXT NOT NULL
+            );
+            """
+        )
+        nconn.execute(
+            "INSERT INTO body_metrics VALUES ('2026-11-18', 182.4, 182.6, '', '2026-11-18T07:00:00Z');"
+        )
+        nconn.execute(
+            """
+            CREATE TABLE garmin_daily_metrics (
+                local_date TEXT PRIMARY KEY,
+                bmr_raw_kcal REAL NOT NULL,
+                bmr_full_day_kcal REAL NOT NULL,
+                active_kcal REAL NOT NULL,
+                total_burn_kcal REAL NOT NULL,
+                steps INTEGER NOT NULL DEFAULT 0,
+                synced_at TEXT NOT NULL
+            );
+            """
+        )
+        nconn.execute(
+            "INSERT INTO garmin_daily_metrics VALUES ('2026-11-18', 1950.0, 1950.0, 600.0, 2550.0, 12500, '2026-11-18T09:00:00Z');"
+        )
+
+    photo_file = pvc_dir / "food_photos" / "2026-11" / "meal-1.webp"
+    photo_file.parent.mkdir(parents=True)
+    photo_file.write_bytes(b"RIFF-FAKE-WEBP")
+
+    # 3. Run in-place migration
+    mig_report = migrate_agent_tasks_pvc(pvc_dir, timestamp_slug="20261118T130000Z")
+    assert mig_report.state_db_backed_up is True
+    assert mig_report.nutrition_db_migrated is True
+    assert mig_report.meals_count == 1
+    assert mig_report.garmin_days_migrated == 1
+    assert mig_report.handoffs_imported == 1
+    assert mig_report.photos_symlinked is True
+
+    # Originals and backups both exist intact
+    assert (pvc_dir / "state.sqlite3").is_file()
+    assert (pvc_dir / "nutrition.sqlite3").is_file()
+    assert (pvc_dir / "backups" / "pre-agy-cloud-20261118T130000Z" / "nutrition.sqlite3").is_file()
+
+    # 4. Boot `agy-cloud` against the migrated PVC with `garmin` + `health` plugins loaded
+    bus = MemoryChannelBus()
+    jobs = RecordingWorkerJobService()
+    registry = PluginRegistry(state_root=pvc_dir, channels=bus, jobs=jobs)
+    await registry.load_all(
+        plugin_sources=[PluginRepoSource(repo=str(external_health_plugins_repo), ref="main")],
+        include_entrypoints=False,
+    )
+    app = create_microkernel_app(registry=registry)
+    client = TestClient(app)
+
+    # Verify historical meal + Garmin dynamic calorie bonus are live in `/api/plugins/health/today`
+    today_resp = client.get("/api/plugins/health/today?date=2026-11-18")
+    assert today_resp.status_code == 200
+    tdata = today_resp.json()
+    assert tdata["total_calories_kcal"] == 650
+    assert tdata["meals"][0]["title"] == "Steak & Eggs"
+    assert tdata["garmin_bonus_kcal"] == round(600 * 0.85)  # 510 kcal
+
+    # Verify both plugin media path AND legacy `/api/media/...` path serve the existing WebP photo without copying
+    p1 = client.get("/api/plugins/health/media/food_photos/2026-11/meal-1.webp")
+    p2 = client.get("/api/media/food_photos/2026-11/meal-1.webp")
+    assert p1.status_code == 200 and p1.content == b"RIFF-FAKE-WEBP"
+    assert p2.status_code == 200 and p2.content == b"RIFF-FAKE-WEBP"
+
+    # Verify imported handoff is accessible via `/api/handoff/handoff-legacy-1`
+    h_resp = client.get("/api/handoff/handoff-legacy-1")
+    assert h_resp.status_code == 200
+    assert h_resp.json()["short_id"] == "HANDOFF-LEGACY"
+    assert "diff --git" in h_resp.json()["patch"]

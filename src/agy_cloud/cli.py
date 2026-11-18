@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 import uvicorn
@@ -12,6 +13,7 @@ from agy_cloud.core.gateway import (
     create_microkernel_app,
 )
 from agy_cloud.core.loader import PluginRegistry
+from agy_cloud.core.migration import migrate_agent_tasks_pvc
 from agy_cloud.core.transports import CompositeChannelBus
 from agy_cloud.core.workers import create_worker_job_service
 from agy_cloud.sdk.spec import AgyCloudConfig, WorkerRunnerConfig
@@ -149,8 +151,19 @@ def main(argv: list[str] | None = None) -> int:
         choices=["", "recording", "local", "k8s"],
         help="Override worker runner mode (`local` runs jobs as local subprocesses without K8s)",
     )
+    p_serve.add_argument(
+        "--auto-migrate-pvc",
+        action="store_true",
+        help="Run non-destructive agent-tasks PVC migration on startup before loading plugins",
+    )
     p_serve.add_argument("--api-token", default="")
     p_serve.add_argument("--base-path", default="")
+
+    p_mig = sub.add_parser(
+        "migrate-pvc",
+        help="Non-destructively migrate an existing agent-tasks PVC (/state) to agy-cloud layout",
+    )
+    p_mig.add_argument("--state-dir", default="/state", help="Path to mounted PVC (/state)")
 
     p_plugins = sub.add_parser("plugins", help="Inspect, scaffold, or export plugins")
     p_sub = p_plugins.add_subparsers(dest="plugins_cmd")
@@ -176,7 +189,14 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
+    if args.cmd == "migrate-pvc":
+        report = migrate_agent_tasks_pvc(Path(args.state_dir))
+        print(json.dumps(asdict(report), indent=2))
+        return 0
+
     if args.cmd == "serve":
+        if args.auto_migrate_pvc:
+            migrate_agent_tasks_pvc(Path(args.state_dir))
         cfg_path = Path(args.config) if args.config else None
         reg = asyncio.run(
             _load_registry(
