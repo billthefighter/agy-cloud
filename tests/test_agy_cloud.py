@@ -42,7 +42,7 @@ def repo_root() -> Path:
 
 @pytest.fixture()
 def external_health_plugins_repo() -> Path:
-    return Path("/Users/lucaswhipple/Dropbox/code_projects/agy-plugins-health")
+    return Path("/Users/lucaswhipple/Dropbox/code_projects/agy-cloud-private-plugins")
 
 
 async def test_git_repo_plugin_loading_and_4_layer_config_override(

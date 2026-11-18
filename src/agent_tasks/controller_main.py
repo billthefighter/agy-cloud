@@ -85,9 +85,10 @@ async def async_main() -> None:
         jobs=RecordingWorkerJobService(),
     )
     for candidate_plugins_dir in (
+        settings.state_dir / "plugin_repos" / "agy-cloud-private-plugins",
         settings.state_dir / "plugin_repos" / "agy-plugins-health",
-        Path("/app/external_plugins/agy-plugins-health"),
-        Path("/Users/lucaswhipple/Dropbox/code_projects/agy-plugins-health"),
+        Path("/app/external_plugins/agy-cloud-private-plugins"),
+        Path("/Users/lucaswhipple/Dropbox/code_projects/agy-cloud-private-plugins"),
         Path("/app/plugins"),
         Path(__file__).resolve().parent.parent.parent / "plugins",
     ):

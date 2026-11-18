@@ -1,6 +1,6 @@
 # `agy-cloud` — Microkernel Cloud Handoff & Plugin Framework for Google Antigravity
 
-`agy-cloud` is an open, generic microkernel runtime and Dual Server+Client Plugin SDK for running background Google Antigravity worker pods on Kubernetes (k3s / K8s), handing off active laptop coding sessions while commuting (`/handoff`), and loading external plugin repositories (such as [`agy-plugins-health`](../agy-plugins-health)) via declarative Kubernetes `ConfigMap` configuration.
+`agy-cloud` is an open, generic microkernel runtime and Dual Server+Client Plugin SDK for running background Google Antigravity worker pods on Kubernetes (k3s / K8s), handing off active laptop coding sessions while commuting (`/handoff`), and loading external plugin repositories (such as [`agy-cloud-private-plugins`](../agy-cloud-private-plugins)) via declarative Kubernetes `ConfigMap` configuration.
 
 See **[`docs/PLUGIN_SPEC.md`](./docs/PLUGIN_SPEC.md)** for the complete v1 Plugin Specification and **[`config.example.yaml`](./config.example.yaml)** for Git plugin loading & ConfigMap overrides.
 
