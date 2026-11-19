@@ -21,13 +21,20 @@ jobs:
 
   docker:
     needs: test
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && !contains(github.event.head_commit.message, '[skip ci]')
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compute immutable image tag
+        id: meta
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          echo "tag=sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
@@ -42,7 +49,9 @@ jobs:
           file: ./Dockerfile.controller
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ghcr.io/${{ github.repository }}/controller:latest
+          tags: |
+            ghcr.io/${{ github.repository }}/controller:latest
+            ghcr.io/${{ github.repository }}/controller:${{ steps.meta.outputs.tag }}
       - name: Build and push multi-arch worker image
         uses: docker/build-push-action@v6
         with:
@@ -50,4 +59,29 @@ jobs:
           file: ./Dockerfile.worker
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ghcr.io/${{ github.repository }}/worker:latest
+          tags: |
+            ghcr.io/${{ github.repository }}/worker:latest
+            ghcr.io/${{ github.repository }}/worker:${{ steps.meta.outputs.tag }}
+      - name: Pin controller & worker image tags in deploy/k3s
+        if: github.ref == 'refs/heads/main'
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          MANIFEST="deploy/k3s/controller-deployment.yaml"
+          sed -i -E "s|(ghcr\.io/billthefighter/agy-cloud/controller):[^[:space:]]+|\1:${TAG}|g" "$MANIFEST"
+          sed -i -E "s|(ghcr\.io/billthefighter/agy-cloud/worker):[^[:space:]]+|\1:${TAG}|g" "$MANIFEST"
+          if git diff --quiet "$MANIFEST"; then
+            echo "Manifest already pinned to ${TAG}"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$MANIFEST"
+          git commit -m "chore(deploy): pin controller & worker images to ${TAG} [skip ci]"
+          for i in 1 2 3; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            git fetch origin main
+            git rebase origin/main
+          done
+          exit 1
