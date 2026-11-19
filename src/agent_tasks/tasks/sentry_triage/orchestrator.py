@@ -364,6 +364,20 @@ class SentryTriageTask:
                 channel_id=ch,
             )
 
+    async def handle_reject(self, issue_id: str, user: str) -> None:
+        record = self.state.get_by_issue_id(issue_id)
+        if not record:
+            return
+        ch = self._task_channel(record)
+        self.state.cancel_timers_for_issue(issue_id)
+        self.state.mark_status(issue_id, IssueStatus.REJECTED)
+        if record.thread_ts:
+            await self.channel.post_thread_message(
+                record.thread_ts,
+                f"Rejected proposal for `{record.short_id}` (by `{user}`). No PR or branch push will be performed.",
+                channel_id=ch,
+            )
+
     async def handle_save_memory_note(self, issue_id: str, user: str) -> None:
         record = self.state.get_by_issue_id(issue_id)
         if not record:

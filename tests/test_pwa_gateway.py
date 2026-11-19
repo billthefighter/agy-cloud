@@ -1287,3 +1287,128 @@ async def test_push_subscriptions_isolated_between_agy_and_health_pwas(tmp_path:
         assert sync_resp.json()["app_mode"] == "health"
         assert sync_resp.json()["prefs"]["coding"] is False
         assert sync_resp.json()["prefs"]["food"] is True
+
+
+def test_handoff_accepts_portable_client_schema_and_mark_pulled(tmp_path: Path) -> None:
+    from agent_tasks.tasks.slack_coding import SlackCodingTask
+
+    settings, state, _push_mgr, gateway, _composite, app, _actions = _make_stack(tmp_path)
+    coding_task = SlackCodingTask(
+        settings=settings,
+        state=state,
+        dispatch_callback=AsyncMock(),
+    )
+    gateway.on_coding_request = lambda prompt, user, ts, chan: coding_task.handle_coding_request(
+        prompt_text=prompt,
+        user=user,
+        thread_ts=ts,
+        channel_id=chan,
+    )
+
+    with TestClient(app) as client:
+        headers = {"Authorization": "Bearer super-secret-pwa-token"}
+        patch_text = (
+            "diff --git a/mod.py b/mod.py\n--- a/mod.py\n+++ b/mod.py\n"
+            "@@ -1 +1,2 @@\n a = 1\n+b = 2\n"
+        )
+        resp = client.post(
+            "/agy/api/handoff",
+            headers=headers,
+            json={
+                "github_repo": "billthefighter/k3s-proxmox-terraform",
+                "base_branch": "burn_down_xfails",
+                "base_sha": "9b4056cf755f9842532a60e405d4abe426f9d8e6",
+                "patch": patch_text,
+                "prompt": "Finish burning down xfails.",
+                "semantic_state": "9/15 cleared; 6 remaining.",
+                "local_conversation_id": "conv-local-123",
+                "model": "gemini-4-neon-medium",
+                "workspace_path": "/tmp/worktree",
+            },
+        )
+        assert resp.status_code == 200
+        created = resp.json()
+        assert created["handoff_id"] == created["issue_id"]
+        assert created["branch"] == "burn_down_xfails"
+        assert created["base_sha"] == "9b4056cf755f9842532a60e405d4abe426f9d8e6"
+        assert created["had_base_patch"] is True
+        assert created["source_conversation_id"] == "conv-local-123"
+
+        issue_id = created["issue_id"]
+        art_dir = settings.state_dir / "artifacts" / issue_id
+        assert "+b = 2" in (art_dir / "initial.patch").read_text(encoding="utf-8")
+        assert "9/15 cleared" in (art_dir / "task_prompt.md").read_text(encoding="utf-8")
+
+        fetched = client.get(
+            f"/agy/api/handoff/{issue_id}?include_patch=true", headers=headers
+        )
+        assert fetched.status_code == 200
+        fetched_json = fetched.json()
+        assert "+b = 2" in fetched_json["patch"]
+        assert "+b = 2" in fetched_json["diff"]
+
+        pulled = client.post(f"/agy/api/handoff/{issue_id}/mark-pulled", headers=headers)
+        assert pulled.status_code == 200
+        assert pulled.json()["pulled"] is True
+
+
+async def test_coding_proposal_emits_reject_button_and_reject_action_marks_rejected(
+    tmp_path: Path,
+) -> None:
+    from agent_tasks.common.models import TriageReport
+
+    _settings, state, _push_mgr, gateway, _composite, app, _actions = _make_stack(tmp_path)
+    rec = state.register_if_new(
+        issue_id="slack-reject-1",
+        short_id="CODE-REJ001",
+        project_slug="rattlsnek",
+        github_repo="lodbrok-app/rattlsnek",
+        default_branch="main",
+        target_branch="feat/my-branch",
+        title="Refactor aligner",
+        permalink="https://github.com/lodbrok-app/rattlsnek",
+        task_kind="slack_coding",
+        thread_ts="1700000123.000100",
+        channel_id="pwa:coding",
+    )
+    assert rec is not None
+
+    async def fake_push_to_pr_branch(issue_id: str, user: str) -> None:
+        return None
+
+    gateway.on_push_to_pr_branch = fake_push_to_pr_branch
+
+    await gateway.post_triage_result(
+        record=rec,
+        report=TriageReport(
+            root_cause="Tightened alignment loop.",
+            fix_summary="Updated align.py",
+            affected_files=["align.py"],
+            verification_commands=["pytest"],
+            tests_passed=True,
+            confidence="high",
+        ),
+        diff_text="diff --git a/align.py b/align.py\n+x = 1\n",
+    )
+
+    msgs = state.list_pwa_messages(rec.issue_id)
+    assert msgs
+    action_ids = [a["id"] for a in msgs[-1].payload.get("actions", [])]
+    assert action_ids == ["push_to_pr_branch", "open_draft_pr", "reject"]
+    reject_btn = next(a for a in msgs[-1].payload["actions"] if a["id"] == "reject")
+    assert reject_btn["label"] == "Reject"
+    assert reject_btn["style"] == "danger"
+
+    with TestClient(app) as client:
+        headers = {"Authorization": "Bearer super-secret-pwa-token"}
+        rej = client.post(
+            f"/agy/api/threads/{rec.issue_id}/actions",
+            headers=headers,
+            json={"action": "reject"},
+        )
+        assert rej.status_code == 200
+        body = rej.json()
+        assert body["ok"] is True
+        assert body["thread"]["status"] == "rejected"
+        assert state.get_by_issue_id(rec.issue_id).status == IssueStatus.REJECTED
+        assert any("Rejected proposal" in m["body_md"] for m in body["messages"])

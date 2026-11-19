@@ -239,6 +239,7 @@ async def async_main() -> None:
             ),
             on_resolve=lambda issue_id, user: triage_ref[0].handle_resolve(issue_id, user),
             on_ignore=lambda issue_id, user: triage_ref[0].handle_ignore(issue_id, user),
+            on_reject=lambda issue_id, user: triage_ref[0].handle_reject(issue_id, user),
             on_thread_feedback=lambda ts, text, user: triage_ref[0].handle_thread_feedback(
                 ts, text, user
             ),

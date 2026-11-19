@@ -381,3 +381,35 @@ def test_workspace_handoff_wrapper_imports_agy_cloud_cli() -> None:
     assert proc.returncode == 0, proc.stderr
     assert "--effort" in proc.stdout
     assert "--model" in proc.stdout
+
+
+def test_portable_handoff_client_rejects_oversized_unpushed_patch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fail fast with a `git push -u origin <branch>` hint when unpushed diff exceeds limit."""
+    import importlib.util
+
+    _origin_mirror, laptop, _main_sha, _local_head_sha = _setup_origin_and_laptop(tmp_path)
+    script_path = (
+        Path(__file__).resolve().parents[1]
+        / "skills"
+        / "handoff"
+        / "scripts"
+        / "handoff_client.py"
+    )
+    spec = importlib.util.spec_from_file_location("portable_handoff_client", script_path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    monkeypatch.setenv("AGY_HANDOFF_MAX_PATCH_BYTES", "10")
+    with pytest.raises(RuntimeError, match="git push -u origin burn_down_xfails"):
+        mod.push_handoff(
+            laptop,
+            base_url="http://localhost:8080",
+            token="tok",
+            ca_cert="",
+            insecure=False,
+            prompt="Continue work",
+            github_repo="lodbrok-app/rattlsnek",
+        )

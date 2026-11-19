@@ -431,7 +431,8 @@ button {
   color: var(--green);
 }
 
-.status-badge.failed {
+.status-badge.failed,
+.status-badge.rejected {
   background: rgba(239, 68, 68, 0.22);
   color: var(--red);
 }

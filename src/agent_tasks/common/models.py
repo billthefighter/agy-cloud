@@ -44,6 +44,7 @@ class IssueStatus(StrEnum):
     PR_OPENED = "pr_opened"
     RESOLVED = "resolved"
     IGNORED = "ignored"
+    REJECTED = "rejected"
     FAILED = "failed"
 
 

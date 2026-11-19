@@ -27,7 +27,16 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-TERMINAL_STATUSES = {"awaiting_review", "completed", "failed", "pr_opened", "resolved"}
+TERMINAL_STATUSES = {
+    "awaiting_review",
+    "completed",
+    "failed",
+    "pr_opened",
+    "resolved",
+    "rejected",
+    "ignored",
+}
+DEFAULT_MAX_INLINE_PATCH_BYTES = 5 * 1024 * 1024  # 5 MiB
 
 _MODEL_SHORTHANDS: dict[str, str] = {
     "hydrogen": "gemini-4-hydrogen",
@@ -197,6 +206,8 @@ def detect_git_metadata(workdir: Path) -> dict[str, str]:
         "github_repo": github_repo,
         "base_branch": base_branch,
         "base_sha": base_sha,
+        "local_branch": local_branch,
+        "head_sha": head_sha,
         "patch": patch,
     }
 
@@ -437,16 +448,42 @@ def push_handoff(
             "Could not detect GitHub repository from `git remote get-url origin`. Pass `--repo owner/name`."
         )
 
+    patch_text = git_meta["patch"]
+    max_patch_bytes = int(
+        os.environ.get("AGY_HANDOFF_MAX_PATCH_BYTES", str(DEFAULT_MAX_INLINE_PATCH_BYTES))
+    )
+    patch_bytes = len(patch_text.encode("utf-8"))
+    if max_patch_bytes > 0 and patch_bytes > max_patch_bytes:
+        patch_mb = patch_bytes / (1024 * 1024)
+        limit_mb = max_patch_bytes / (1024 * 1024)
+        local_branch = git_meta.get("local_branch") or git_meta["base_branch"]
+        head_sha = git_meta.get("head_sha") or ""
+        if head_sha and head_sha != git_meta["base_sha"] and local_branch != "HEAD":
+            raise RuntimeError(
+                f"Inline handoff patch is {patch_mb:.1f} MiB (exceeds {limit_mb:.1f} MiB limit) "
+                f"because local branch `{local_branch}` ({head_sha[:8]}) has unpushed commits "
+                f"diverged from `{git_meta['base_branch']}` ({git_meta['base_sha'][:8]}). "
+                f"Run `git push -u origin {local_branch}` first, then retry `/handoff`."
+            )
+        raise RuntimeError(
+            f"Inline handoff patch is {patch_mb:.1f} MiB (exceeds {limit_mb:.1f} MiB limit). "
+            "Commit & push large/binary changes or set AGY_HANDOFF_MAX_PATCH_BYTES to override."
+        )
+
     payload = {
+        "repo": repo,
         "github_repo": repo,
+        "branch": git_meta["base_branch"],
         "base_branch": git_meta["base_branch"],
         "base_sha": git_meta["base_sha"],
-        "patch": git_meta["patch"],
+        "base_patch": patch_text,
+        "patch": patch_text,
         "prompt": prompt,
         "semantic_state": semantic_state,
         "verify_hint": verify_hint,
         "focus_subdir": focus_subdir,
         "model": model,
+        "source_conversation_id": local_conversation_id or "",
         "local_conversation_id": local_conversation_id or None,
         "workspace_path": str(workdir),
     }
@@ -458,10 +495,13 @@ def push_handoff(
         ca_cert=ca_cert,
         insecure=insecure,
     )
+    resolved_id = resp.get("handoff_id") or resp.get("issue_id") or resp.get("short_id")
+    if resolved_id and not resp.get("handoff_id"):
+        resp["handoff_id"] = resolved_id
     save_local_handoff_state(
         workdir,
         {
-            "handoff_id": resp.get("handoff_id"),
+            "handoff_id": resolved_id,
             "short_id": resp.get("short_id"),
             "github_repo": repo,
             "base_sha": git_meta["base_sha"],
@@ -521,7 +561,7 @@ def poll_until_ready_and_pull(
             is_terminal = bool(data.get("is_terminal")) or status in TERMINAL_STATUSES
 
             if is_terminal:
-                patch_text = str(data.get("patch") or "")
+                patch_text = str(data.get("patch") or data.get("diff") or "")
                 base_sha = str(data.get("base_sha") or "")
                 applied_ok = True
                 apply_msg = "Patch application skipped (--no-apply)."
@@ -724,7 +764,9 @@ def main(argv: list[str] | None = None) -> int:
                 focus_subdir=args.focus_subdir,
                 model=normalize_model_with_effort(args.model, args.effort) or "gemini-4-hydrogen",
             )
-            handoff_id = str(created["handoff_id"])
+            handoff_id = str(
+                created.get("handoff_id") or created.get("issue_id") or created.get("short_id") or ""
+            )
             print(_format_summary(created), flush=True)
         elif not handoff_id:
             local_state = load_local_handoff_state(workdir)
@@ -738,7 +780,9 @@ def main(argv: list[str] | None = None) -> int:
                     ca_cert=ca_cert,
                     insecure=insecure,
                 )
-                handoff_id = str(latest["handoff_id"])
+                handoff_id = str(
+                    latest.get("handoff_id") or latest.get("issue_id") or latest.get("short_id") or "latest"
+                )
 
         result = poll_until_ready_and_pull(
             workdir,
@@ -792,16 +836,17 @@ def main(argv: list[str] | None = None) -> int:
         if cmd == "pull" and not getattr(args, "no_apply", False):
             ok, msg = apply_remote_patch_safely(
                 workdir,
-                patch_text=str(data.get("patch") or ""),
+                patch_text=str(data.get("patch") or data.get("diff") or ""),
                 expected_base_sha=str(data.get("base_sha") or ""),
             )
             data["applied_ok"] = ok
             data["apply_message"] = msg
-            if ok and data.get("handoff_id"):
+            resolved_pull_id = data.get("handoff_id") or data.get("issue_id") or data.get("short_id")
+            if ok and resolved_pull_id:
                 try:
                     http_json(
                         "POST",
-                        f"{base_url}/api/handoff/{urllib.parse.quote(str(data['handoff_id']))}/mark-pulled",
+                        f"{base_url}/api/handoff/{urllib.parse.quote(str(resolved_pull_id))}/mark-pulled",
                         token=token,
                         ca_cert=ca_cert,
                         insecure=insecure,

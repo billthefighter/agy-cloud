@@ -230,15 +230,21 @@ class _CodingRequest(BaseModel):
 class _HandoffCreateRequest(BaseModel):
     prompt: str
     repo: str = ""
+    github_repo: str = ""
     branch: str = ""
+    base_branch: str = ""
     base_sha: str = ""
     base_patch: str = ""
+    patch: str = ""
+    semantic_state: str = ""
     verify_hint: str = ""
     focus_subdir: str = ""
     model: str = ""
     worker_backend: str = ""
     title: str = ""
     source_conversation_id: str = ""
+    local_conversation_id: str | None = None
+    workspace_path: str = ""
 
 
 class _HandoffFeedbackRequest(BaseModel):
@@ -367,6 +373,7 @@ class PwaGatewayAdapter:
         on_push_to_pr_branch: PushBranchCallback | None = None,
         on_resolve: ResolveCallback | None = None,
         on_ignore: IgnoreCallback | None = None,
+        on_reject: IgnoreCallback | None = None,
         on_thread_feedback: FeedbackCallback | None = None,
         on_status_query: StatusCallback | None = None,
         on_k8s_query: StatusCallback | None = None,
@@ -394,6 +401,7 @@ class PwaGatewayAdapter:
         self.on_push_to_pr_branch = on_push_to_pr_branch
         self.on_resolve = on_resolve
         self.on_ignore = on_ignore
+        self.on_reject = on_reject
         self.on_thread_feedback = on_thread_feedback
         self.on_status_query = on_status_query
         self.on_k8s_query = on_k8s_query
@@ -599,6 +607,7 @@ class PwaGatewayAdapter:
         )
         payload: dict[str, Any] = {
             "issue_id": record.issue_id,
+            "handoff_id": record.issue_id,
             "short_id": record.short_id,
             "thread_id": record.issue_id,
             "thread_ts": record.thread_ts,
@@ -625,6 +634,7 @@ class PwaGatewayAdapter:
         }
         if include_diff:
             payload["diff"] = diff_text
+            payload["patch"] = diff_text
         return payload
 
     def _ensure_thread_for_ts(
@@ -805,6 +815,8 @@ class PwaGatewayAdapter:
                 }
             )
             actions.append({"id": "ignore", "label": "Ignore", "style": "danger"})
+        else:
+            actions.append({"id": "reject", "label": "Reject", "style": "danger"})
         if (
             report.proposed_memory_note
             and report.proposed_memory_note.strip()
@@ -1632,18 +1644,26 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
         prompt = body.prompt.strip()
         if not prompt:
             raise HTTPException(status_code=400, detail="Handoff prompt cannot be empty.")
+        semantic_state = body.semantic_state.strip()
+        if semantic_state and semantic_state not in prompt:
+            prompt = f"{prompt}\n\n## Semantic State\n{semantic_state}"
 
         targets = gateway._load_targets()
         default_repo = targets.slack_coding.github_repo
         model_override, cleaned = parse_model_override(prompt)
         selected_model = model_override or body.model.strip()
-        repo = body.repo.strip() or default_repo
-        branch = body.branch.strip() or (
-            targets.slack_coding.default_branch if repo == default_repo else "main"
+        repo = body.repo.strip() or body.github_repo.strip() or default_repo
+        branch = (
+            body.branch.strip()
+            or body.base_branch.strip()
+            or (targets.slack_coding.default_branch if repo == default_repo else "main")
         )
         base_sha = body.base_sha.strip()
-        base_patch = body.base_patch
+        base_patch = body.base_patch if body.base_patch.strip() else body.patch
         had_base_patch = bool(base_patch.strip())
+        source_conversation_id = (
+            body.source_conversation_id.strip() or (body.local_conversation_id or "").strip()
+        )
 
         tokens: list[str] = []
         if model_override:
@@ -1698,7 +1718,8 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
                 body.worker_backend.strip() or targets.slack_coding.handoff_worker_backend
             ),
             "title": first_line,
-            "source_conversation_id": body.source_conversation_id.strip(),
+            "source_conversation_id": source_conversation_id,
+            "workspace_path": body.workspace_path.strip(),
             "created_at": datetime.now(UTC).isoformat(),
         }
         (art_dir / "handoff_meta.json").write_text(
@@ -1762,7 +1783,7 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
                 "branch": branch,
                 "base_sha": base_sha,
                 "had_base_patch": had_base_patch,
-                "source_conversation_id": body.source_conversation_id.strip(),
+                "source_conversation_id": source_conversation_id,
             },
         )
         ack_msg = gateway.state.append_pwa_message(
@@ -1803,11 +1824,22 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
         handoff_id: str,
         repo: str = Query(default=""),
         include_diff: bool = Query(default=True),
+        include_patch: bool | None = Query(default=None),
     ) -> dict[str, Any]:
         record = gateway._resolve_handoff_record(handoff_id, repo=repo.strip())
         if record is None:
             raise HTTPException(status_code=404, detail=f"Handoff `{handoff_id}` not found.")
-        return gateway._build_handoff_payload(record, include_diff=include_diff)
+        effective_include_diff = include_patch if include_patch is not None else include_diff
+        return gateway._build_handoff_payload(record, include_diff=effective_include_diff)
+
+    @router.post("/api/handoff/{handoff_id}/mark-pulled", dependencies=[Depends(_require_auth)])
+    async def mark_handoff_pulled(handoff_id: str) -> dict[str, Any]:
+        record = gateway._resolve_handoff_record(handoff_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"Handoff `{handoff_id}` not found.")
+        payload = gateway._build_handoff_payload(record, include_diff=False)
+        payload["pulled"] = True
+        return payload
 
     @router.post("/api/handoff/{handoff_id}/feedback", dependencies=[Depends(_require_auth)])
     async def reply_to_handoff(
@@ -1952,6 +1984,17 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
             await gateway.on_resolve(issue_id, "mobile")
         elif act == "ignore" and gateway.on_ignore is not None:
             await gateway.on_ignore(issue_id, "mobile")
+        elif act == "reject":
+            if gateway.on_reject is not None:
+                await gateway.on_reject(issue_id, "mobile")
+            else:
+                gateway.state.cancel_timers_for_issue(issue_id)
+                gateway.state.mark_status(issue_id, IssueStatus.REJECTED)
+                gateway.state.append_pwa_message(
+                    thread_id=thread_id,
+                    sender="system",
+                    body_md="Rejected proposal (by `mobile`). No PR or branch push will be performed.",
+                )
         elif act == "save_memory_note" and gateway.on_save_memory_note is not None:
             await gateway.on_save_memory_note(issue_id, "mobile")
         else:
