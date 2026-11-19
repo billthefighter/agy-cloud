@@ -19,6 +19,7 @@ import re
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -27,6 +28,37 @@ from pathlib import Path
 from typing import Any
 
 TERMINAL_STATUSES = {"awaiting_review", "completed", "failed", "pr_opened", "resolved"}
+
+_MODEL_SHORTHANDS: dict[str, str] = {
+    "hydrogen": "gemini-4-hydrogen",
+    "neon": "gemini-4-neon",
+    "carbon": "gemini-4-carbon",
+    "argon": "gemini-4-argon",
+    "flash": "gemini-3.8-flash",
+}
+_EFFORT_TIERS = ("low", "medium", "high")
+
+
+def normalize_model_with_effort(model: str = "", effort: str = "") -> str:
+    raw_model = (model or "").strip() or os.environ.get("AGY_HANDOFF_MODEL", "").strip()
+    raw_effort = (effort or "").strip().lower()
+    if raw_effort and raw_effort not in _EFFORT_TIERS:
+        raise ValueError(f"Invalid --effort `{effort}`; expected one of: low, medium, high.")
+    if not raw_model:
+        return ""
+    cleaned = re.sub(r"[()]", " ", raw_model).strip()
+    cleaned = re.sub(r"\s+", "-", cleaned).lower()
+    existing_effort = ""
+    stem = cleaned
+    for tier in _EFFORT_TIERS:
+        suffix = f"-{tier}"
+        if cleaned.endswith(suffix):
+            existing_effort = tier
+            stem = cleaned[: -len(suffix)]
+            break
+    canonical_stem = _MODEL_SHORTHANDS.get(stem, stem)
+    final_effort = raw_effort or existing_effort
+    return f"{canonical_stem}-{final_effort}" if final_effort else canonical_stem
 
 
 def _parse_dotenv_file(path: Path) -> dict[str, str]:
@@ -78,29 +110,88 @@ def resolve_connection_config(
 
 
 def detect_git_metadata(workdir: Path) -> dict[str, str]:
-    """Extract `github_repo`, `base_branch`, `base_sha`, and uncommitted `patch` from `workdir`."""
+    """Extract `github_repo`, `base_branch`, `base_sha`, and `patch` from `workdir`.
 
-    def _git(*args: str, check: bool = True) -> str:
-        proc = subprocess.run(
+    When `HEAD` has unpushed local commits not reachable from `origin/*`, resolves the
+    closest `origin/*` merge-base so the remote pod can check out a reachable commit and
+    receive both unpushed commits and uncommitted edits as a squashed `patch`.
+    """
+
+    def _git(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
             ["git", "-C", str(workdir), *args],
             check=check,
             capture_output=True,
             text=True,
         )
-        return proc.stdout
 
-    remote_url = _git("remote", "get-url", "origin", check=False).strip()
+    remote_url = _git("remote", "get-url", "origin", check=False).stdout.strip()
     github_repo = ""
     m = re.search(r"github\.com[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?$", remote_url)
     if m:
         github_repo = m.group(1)
 
-    base_branch = _git("rev-parse", "--abbrev-ref", "HEAD", check=False).strip() or "main"
-    base_sha = _git("rev-parse", "HEAD", check=False).strip()
+    local_branch = _git("rev-parse", "--abbrev-ref", "HEAD", check=False).stdout.strip() or "main"
+    head_sha = _git("rev-parse", "HEAD", check=False).stdout.strip()
+    base_branch = local_branch if local_branch != "HEAD" else "main"
+    base_sha = head_sha
+    diff_target = "HEAD"
 
-    # Mark untracked files intent-to-add so `git diff --binary HEAD` captures new files
+    refs_proc = _git("for-each-ref", "--format=%(refname:short)", "refs/remotes/origin", check=False)
+    origin_refs = [
+        r.strip()
+        for r in refs_proc.stdout.splitlines()
+        if r.strip() and r.strip() not in {"origin", "origin/HEAD"}
+    ]
+    if head_sha and refs_proc.returncode == 0 and origin_refs:
+        contains_proc = _git(
+            "branch", "-r", "--contains", head_sha, "--format=%(refname:short)", check=False
+        )
+        containing = [
+            r.strip()
+            for r in contains_proc.stdout.splitlines()
+            if r.strip().startswith("origin/") and r.strip() != "origin/HEAD"
+        ]
+        if containing:
+            preferred = [
+                f"origin/{local_branch}" if local_branch != "HEAD" else "",
+                "origin/main",
+                "origin/master",
+            ]
+            chosen = next((ref for ref in preferred if ref and ref in containing), containing[0])
+            base_branch = chosen.removeprefix("origin/")
+        else:
+            candidates: list[str] = []
+            up_proc = _git(
+                "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}", check=False
+            )
+            if up_proc.returncode == 0 and up_proc.stdout.strip() in origin_refs:
+                candidates.append(up_proc.stdout.strip())
+            if local_branch != "HEAD" and f"origin/{local_branch}" in origin_refs:
+                candidates.append(f"origin/{local_branch}")
+            sym_proc = _git("symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False)
+            if sym_proc.returncode == 0 and sym_proc.stdout.strip() in origin_refs:
+                candidates.append(sym_proc.stdout.strip())
+            for d in ("origin/main", "origin/master"):
+                if d in origin_refs:
+                    candidates.append(d)
+            candidates.extend(origin_refs)
+            seen: set[str] = set()
+            for cand in candidates:
+                if cand in seen:
+                    continue
+                seen.add(cand)
+                mb_proc = _git("merge-base", head_sha, cand, check=False)
+                if mb_proc.returncode == 0 and mb_proc.stdout.strip():
+                    base_branch = cand.removeprefix("origin/")
+                    base_sha = mb_proc.stdout.strip()
+                    if base_sha != head_sha:
+                        diff_target = base_sha
+                    break
+
+    # Mark untracked files intent-to-add so `git diff --binary` captures new files
     subprocess.run(["git", "-C", str(workdir), "add", "-N", "."], check=False, capture_output=True)
-    patch = _git("diff", "--binary", "HEAD", check=False)
+    patch = _git("diff", "--binary", diff_target, check=False).stdout
 
     return {
         "github_repo": github_repo,
@@ -196,7 +287,83 @@ def apply_remote_patch_safely(
     ).stdout.strip()
 
     if expected_base_sha and current_sha and current_sha != expected_base_sha:
-        # Local HEAD moved since handoff; attempt 3-way apply without resetting HEAD
+        # If expected_base_sha is an ancestor of local HEAD (unpushed local commits),
+        # rebase the cumulative remote patch onto HEAD via a temporary detached worktree.
+        is_anc = subprocess.run(
+            ["git", "-C", str(workdir), "merge-base", "--is-ancestor", expected_base_sha, "HEAD"],
+            check=False,
+            capture_output=True,
+        )
+        if is_anc.returncode == 0:
+            with tempfile.TemporaryDirectory(prefix="agy-handoff-rebase-") as tmp_root:
+                wt_dir = Path(tmp_root) / "wt"
+                add_wt = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(workdir),
+                        "worktree",
+                        "add",
+                        "--detach",
+                        str(wt_dir),
+                        expected_base_sha,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                if add_wt.returncode == 0:
+                    try:
+                        ap = subprocess.run(
+                            ["git", "-C", str(wt_dir), "apply", "--whitespace=nowarn", str(remote_patch_path)],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                        )
+                        if ap.returncode != 0:
+                            ap = subprocess.run(
+                                ["git", "-C", str(wt_dir), "apply", "--3way", "--whitespace=nowarn", str(remote_patch_path)],
+                                check=False,
+                                capture_output=True,
+                                text=True,
+                            )
+                        if ap.returncode == 0:
+                            subprocess.run(["git", "-C", str(wt_dir), "add", "-A"], check=False, capture_output=True)
+                            tree = subprocess.run(
+                                ["git", "-C", str(wt_dir), "write-tree"],
+                                check=False,
+                                capture_output=True,
+                                text=True,
+                            ).stdout.strip()
+                            if tree:
+                                rebased = subprocess.run(
+                                    ["git", "-C", str(workdir), "diff", "--binary", "HEAD", tree],
+                                    check=False,
+                                    capture_output=True,
+                                    text=True,
+                                ).stdout
+                                if not rebased.strip():
+                                    return True, f"Working tree already matches remote pod state at `{current_sha[:8]}`."
+                                rebased_path = git_dir / "agy_handoff_rebased.patch"
+                                rebased_path.write_text(rebased, encoding="utf-8")
+                                subprocess.run(["git", "-C", str(workdir), "reset", "--hard", "HEAD"], check=False, capture_output=True)
+                                subprocess.run(["git", "-C", str(workdir), "clean", "-fd"], check=False, capture_output=True)
+                                apply_rebased = subprocess.run(
+                                    ["git", "-C", str(workdir), "apply", "--whitespace=nowarn", str(rebased_path)],
+                                    check=False,
+                                    capture_output=True,
+                                    text=True,
+                                )
+                                if apply_rebased.returncode == 0:
+                                    return True, f"Rebased & applied remote delta onto unpushed HEAD `{current_sha[:8]}` (backup at `{backup_patch_path}`)."
+                    finally:
+                        subprocess.run(
+                            ["git", "-C", str(workdir), "worktree", "remove", "--force", str(wt_dir)],
+                            check=False,
+                            capture_output=True,
+                        )
+
+        # Fallback: attempt 3-way apply without resetting HEAD
         proc = subprocess.run(
             ["git", "-C", str(workdir), "apply", "--3way", str(remote_patch_path)],
             check=False,
@@ -448,7 +615,17 @@ def main(argv: list[str] | None = None) -> int:
     p_start.add_argument("--repo", default="", help="Override GitHub repo (owner/name)")
     p_start.add_argument("--verify-hint", default="", help="Verification command for the worker")
     p_start.add_argument("--focus-subdir", default="", help="Focus subdirectory inside repo")
-    p_start.add_argument("--model", default="gemini-4-hydrogen", help="Worker model")
+    p_start.add_argument(
+        "--model",
+        default="",
+        help="Worker model ID or shorthand (e.g. gemini-4-neon-medium, claude-sonnet-5-5-medium)",
+    )
+    p_start.add_argument(
+        "--effort",
+        default="",
+        choices=("", "low", "medium", "high"),
+        help="Optional effort tier (low, medium, high) combined with --model",
+    )
     p_start.add_argument(
         "--handoff-id", default="", help="Watch an existing handoff ID instead of pushing"
     )
@@ -467,7 +644,17 @@ def main(argv: list[str] | None = None) -> int:
     p_push.add_argument("--repo", default="", help="Override GitHub repo (owner/name)")
     p_push.add_argument("--verify-hint", default="", help="Verification command for the worker")
     p_push.add_argument("--focus-subdir", default="", help="Focus subdirectory inside repo")
-    p_push.add_argument("--model", default="gemini-4-hydrogen", help="Worker model")
+    p_push.add_argument(
+        "--model",
+        default="",
+        help="Worker model ID or shorthand (e.g. gemini-4-neon-medium, claude-sonnet-5-5-medium)",
+    )
+    p_push.add_argument(
+        "--effort",
+        default="",
+        choices=("", "low", "medium", "high"),
+        help="Optional effort tier (low, medium, high) combined with --model",
+    )
 
     # `watch`: Poll an existing handoff on wake
     p_watch = sub.add_parser(
@@ -516,7 +703,7 @@ def main(argv: list[str] | None = None) -> int:
             github_repo=args.repo,
             verify_hint=args.verify_hint,
             focus_subdir=args.focus_subdir,
-            model=args.model,
+            model=normalize_model_with_effort(args.model, args.effort) or "gemini-4-hydrogen",
         )
         print(json.dumps(created, indent=2) if args.json else _format_summary(created))
         return 0
@@ -535,7 +722,7 @@ def main(argv: list[str] | None = None) -> int:
                 github_repo=args.repo,
                 verify_hint=args.verify_hint,
                 focus_subdir=args.focus_subdir,
-                model=args.model,
+                model=normalize_model_with_effort(args.model, args.effort) or "gemini-4-hydrogen",
             )
             handoff_id = str(created["handoff_id"])
             print(_format_summary(created), flush=True)

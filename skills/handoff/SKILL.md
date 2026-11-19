@@ -15,14 +15,18 @@ Use this skill when the user invokes `/handoff` (or asks to hand off a task to t
      2. Run `handoff_client.py start` with `--prompt` and `--state`. This pushes the current git base SHA, branch, uncommitted working-tree diff (`git diff --binary HEAD`), and prompt to `POST /api/handoff` on the k3s cluster, and **immediately enters sleep-resilient polling mode**.
      3. Use `WaitMsBeforeAsync=3000` on `run_command` so the push confirmation is captured immediately while the sleep-resilient poll loop continues in the background.
      4. **Stop calling tools after launching the background poller.** While the laptop is asleep in the car, `handoff_client.py` ignores transient VPN/network drops. As soon as the laptop wakes and the remote k3s pod reaches a terminal state (`awaiting_review`, `completed`, or `failed`), the background task automatically applies the remote `fix.patch` to the local working tree, marks the handoff pulled, and exits — triggering **Reactive Wakeup** in this conversation so you can immediately summarize the pod's changes!
+   - **Model & Effort Selection (Default to Self):** Always pass `--model` matching **your own active model + effort tier** (e.g. `gemini-4-neon-medium`, `gemini-4-hydrogen-high`, `claude-sonnet-5-5-medium`) unless the user explicitly asks for another model or effort tier (in which case pass `--model <model>` and optionally `--effort <low|medium|high>`).
    - **Command:**
      ```bash
      python3 ~/.gemini/config/skills/handoff/scripts/handoff_client.py start \
        --workdir "<workspace_root>" \
+       --model "<your-active-model-id>" \
+       --effort "<low|medium|high>" \
        --prompt "<remaining task instructions>" \
        --state "<compact semantic state s_t>" \
        --verify-hint "<pytest / linter command>"
      ```
+     *(Omit `--effort` if `--model` already includes the effort suffix, e.g. `gemini-4-neon-medium`.)*
    - *(Note: If the user runs bare `/handoff` when an unpulled handoff is already active for this workspace and provides no new task instructions, omit `--prompt` so `handoff_client.py start` attaches directly to the active handoff in poll-on-wake mode.)*
 
 2. **`/handoff push <instructions>` (Push Only — No Local Poller)**
@@ -30,6 +34,7 @@ Use this skill when the user invokes `/handoff` (or asks to hand off a task to t
      ```bash
      python3 ~/.gemini/config/skills/handoff/scripts/handoff_client.py push \
        --workdir "<workspace_root>" \
+       --model "<your-active-model-id>" \
        --prompt "<remaining task instructions>" \
        --state "<compact semantic state s_t>" \
        --verify-hint "<pytest / linter command>"
