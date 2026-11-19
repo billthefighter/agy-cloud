@@ -1,4 +1,4 @@
-const CACHE_NAME = "agy-pwa-shell-v8";
+const CACHE_NAME = "agy-pwa-shell-v9";
 const SHELL_ASSETS = [
   "./",
   "./static/styles.css",
