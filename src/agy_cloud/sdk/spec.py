@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
@@ -27,8 +27,12 @@ class PluginPermissionError(PermissionError):
     """Raised when a plugin attempts to use a capability not granted in its permissions."""
 
 
+WorkerBackend = Literal["agy_cli", "sdk"]
+
+
 class DefaultPluginConfig(BaseModel):
     enabled: bool = True
+    worker_backend: WorkerBackend = "sdk"
 
 
 class ChannelRoleSpec(BaseModel):
@@ -203,6 +207,7 @@ class JobSpec:
     focus_subdir: str = ""
     verify_hint: str = ""
     model: str = "gemini-4-hydrogen"
+    worker_backend: WorkerBackend = "sdk"
     turn: int = 1
     conversation_id: str | None = None
     system_instructions: str | None = None

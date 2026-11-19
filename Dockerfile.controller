@@ -14,7 +14,7 @@ COPY src ./src
 COPY plugins ./plugins
 COPY skills ./skills
 
-RUN uv pip install --system --no-cache ".[k8s,slack]" \
+RUN uv pip install --system --no-cache ".[k8s,slack,worker]" \
     && useradd -m -u 1000 agy \
     && mkdir -p /state \
     && chown -R agy:agy /app /state

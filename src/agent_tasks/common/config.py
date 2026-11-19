@@ -24,11 +24,66 @@ def resolve_gemini_auth(env: Mapping[str, str]) -> tuple[str | None, bool]:
     return api_key, use_vertex
 
 
+WorkerBackend = Literal["agy_cli", "sdk"]
+
+CLI_MODEL_DEFAULTS: dict[str, str] = {
+    "gemini-4-hydrogen": "gemini-4-hydrogen-medium",
+    "gemini-4-neon": "gemini-4-neon-medium",
+    "gemini-4-carbon": "gemini-4-carbon-medium",
+    "gemini-4-argon": "gemini-4-argon-medium",
+    "gemini-3.8-flash": "gemini-3.8-flash-medium",
+}
+
+
+def resolve_worker_model_for_cli(model: str) -> str:
+    """Map an SDK-style model ID to an `agy` CLI model ID (preserving explicit CLI IDs)."""
+    clean = (model or "").strip() or DEFAULT_WORKER_MODEL
+    return CLI_MODEL_DEFAULTS.get(clean, clean)
+
+
+def normalize_worker_backend(value: str | None) -> WorkerBackend | None:
+    """Normalize a backend name (`agy_cli` / `agy-cli` / `account` or `sdk` / `api_key`)."""
+    raw = (value or "").strip().lower().replace("-", "_")
+    if raw in {"agy_cli", "agy", "cli", "account"}:
+        return "agy_cli"
+    if raw in {"sdk", "api_key", "api"}:
+        return "sdk"
+    return None
+
+
+def resolve_worker_backend(
+    targets: TargetsConfig,
+    *,
+    task_kind: str,
+    is_handoff: bool = False,
+    override: str | None = None,
+) -> WorkerBackend:
+    """Resolve whether a worker pod runs via `agy_cli` (Google account) or `sdk` (API key)."""
+    explicit = normalize_worker_backend(override)
+    if explicit is not None:
+        return explicit
+    if is_handoff:
+        return targets.slack_coding.handoff_worker_backend
+    if task_kind == "sentry":
+        return targets.sentry.worker_backend
+    if task_kind == "slack_coding":
+        return targets.slack_coding.worker_backend
+    if task_kind == "ci_healer":
+        return targets.ci_healer.worker_backend
+    if task_kind == "k8s_watchdog":
+        return targets.k8s_watchdog.worker_backend
+    if task_kind == "dep_upgrader":
+        return targets.dep_upgrader.worker_backend
+    return "sdk"
+
+
 DEFAULT_WORKER_MODEL = "gemini-4-hydrogen"
 
 MODEL_ALIASES: dict[str, str] = {
     "hydrogen": "gemini-4-hydrogen",
     "gemini-4-hydrogen": "gemini-4-hydrogen",
+    "neon": "gemini-4-neon",
+    "gemini-4-neon": "gemini-4-neon",
     "carbon": "gemini-4-carbon",
     "gemini-4-carbon": "gemini-4-carbon",
     "argon": "gemini-4-argon",
@@ -42,11 +97,11 @@ _BRACKET_MODEL_RE = re.compile(
     re.IGNORECASE,
 )
 _PHRASE_MODEL_RE = re.compile(
-    r"(?:^|\s)(?:with|use|using)\s+(hydrogen|carbon|argon|flash)\b(?=[.!?\s,:-]*$)",
+    r"(?:^|\s)(?:with|use|using)\s+(hydrogen|neon|carbon|argon|flash)\b(?=[.!?\s,:-]*$)",
     re.IGNORECASE,
 )
 _LEADING_MODEL_RE = re.compile(
-    r"^(?:with|use|using)\s+(hydrogen|carbon|argon|flash)\b[:,\s-]+",
+    r"^(?:with|use|using)\s+(hydrogen|neon|carbon|argon|flash)\b[:,\s-]+",
     re.IGNORECASE,
 )
 
@@ -90,6 +145,7 @@ class SentryGlobalConfig(pydantic.BaseModel):
     settle_seconds: int = 180
     min_events_bypass_settle: int = 2
     regression_cooldown_seconds: int = 3600
+    worker_backend: WorkerBackend = "sdk"
 
 
 class ProjectTargetConfig(pydantic.BaseModel):
@@ -109,6 +165,8 @@ class SlackCodingConfig(pydantic.BaseModel):
         "cd rattlsnek && uv sync --package edge --package edge_utils && "
         "uv run ruff check . && uv run ty check"
     )
+    worker_backend: WorkerBackend = "sdk"
+    handoff_worker_backend: WorkerBackend = "agy_cli"
 
 
 class CiRepoConfig(pydantic.BaseModel):
@@ -123,6 +181,7 @@ class CiHealerConfig(pydantic.BaseModel):
     lookback_hours: int = 6
     settle_seconds: int = 90
     cooldown_seconds: int = 3600
+    worker_backend: WorkerBackend = "sdk"
     repos: list[CiRepoConfig] = pydantic.Field(default_factory=lambda: [CiRepoConfig()])
 
 
@@ -140,6 +199,7 @@ class K8sWatchdogConfig(pydantic.BaseModel):
     github_repo: str = "lodbrok-app/rattlsnek"
     default_branch: str = "main"
     verify_hint: str = "cd rattlsnek && uv run ruff check ."
+    worker_backend: WorkerBackend = "sdk"
 
 
 class DepUpgraderConfig(pydantic.BaseModel):
@@ -151,6 +211,7 @@ class DepUpgraderConfig(pydantic.BaseModel):
         "cd rattlsnek && uv sync --package edge --package edge_utils && "
         "uv run ruff check edge edge_utils && uv run pytest edge edge_utils"
     )
+    worker_backend: WorkerBackend = "sdk"
 
 
 class ChannelRoutingConfig(pydantic.BaseModel):

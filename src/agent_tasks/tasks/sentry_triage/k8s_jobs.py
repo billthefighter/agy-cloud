@@ -23,6 +23,7 @@ def build_triage_job_manifest(
     settings: ControllerSettings,
     record: IssueRecord,
     target: ProjectTargetConfig,
+    worker_backend: str = "sdk",
 ) -> client.V1Job:
     """Build a locked-down Kubernetes batch/v1 Job for isolated AGY triage on makesense.
 
@@ -92,12 +93,14 @@ def build_triage_job_manifest(
         ],
     )
 
+    use_agy_cli = worker_backend == "agy_cli"
     worker_env = [
         client.V1EnvVar(name="ISSUE_ID", value=record.issue_id),
         client.V1EnvVar(name="SHORT_ID", value=record.short_id),
         client.V1EnvVar(name="PROJECT_SLUG", value=record.project_slug),
         client.V1EnvVar(name="GITHUB_REPO", value=record.github_repo),
         client.V1EnvVar(name="TASK_KIND", value=record.task_kind),
+        client.V1EnvVar(name="WORKER_BACKEND", value=worker_backend),
         client.V1EnvVar(name="WORKER_MODEL", value=worker_model),
         client.V1EnvVar(name="TURN", value=str(record.turn)),
         client.V1EnvVar(name="CONVERSATION_ID", value=record.conversation_id or ""),
@@ -110,6 +113,46 @@ def build_triage_job_manifest(
         client.V1EnvVar(name="UV_CACHE_DIR", value="/caches/uv"),
         client.V1EnvVar(name="npm_config_cache", value="/caches/npm"),
     ]
+    if use_agy_cli:
+        worker_env.extend(
+            [
+                client.V1EnvVar(name="HOME", value="/home/agy"),
+                client.V1EnvVar(name="TZ", value="UTC"),
+            ]
+        )
+
+    worker_volume_mounts = [
+        client.V1VolumeMount(name="work", mount_path="/work"),
+        client.V1VolumeMount(
+            name="state",
+            mount_path="/session",
+            sub_path=session_subpath,
+        ),
+        client.V1VolumeMount(
+            name="state",
+            mount_path="/artifacts",
+            sub_path=artifact_subpath,
+        ),
+        client.V1VolumeMount(
+            name="state",
+            mount_path="/memory",
+            sub_path="memory",
+            read_only=True,
+        ),
+        client.V1VolumeMount(
+            name="state",
+            mount_path="/caches",
+            sub_path="caches",
+        ),
+    ]
+    if use_agy_cli:
+        worker_volume_mounts.append(
+            client.V1VolumeMount(
+                name="state",
+                mount_path="/home/agy/.gemini",
+                sub_path="agy-auth",
+            )
+        )
 
     worker_container = client.V1Container(
         name="agy-worker",
@@ -118,7 +161,10 @@ def build_triage_job_manifest(
         env=worker_env,
         env_from=[
             client.V1EnvFromSource(
-                secret_ref=client.V1SecretEnvSource(name=settings.worker_secret_name)
+                secret_ref=client.V1SecretEnvSource(
+                    name=settings.worker_secret_name,
+                    optional=use_agy_cli,
+                )
             )
         ],
         resources=client.V1ResourceRequirements(
@@ -129,30 +175,7 @@ def build_triage_job_manifest(
             allow_privilege_escalation=False,
             capabilities=client.V1Capabilities(drop=["ALL"]),
         ),
-        volume_mounts=[
-            client.V1VolumeMount(name="work", mount_path="/work"),
-            client.V1VolumeMount(
-                name="state",
-                mount_path="/session",
-                sub_path=session_subpath,
-            ),
-            client.V1VolumeMount(
-                name="state",
-                mount_path="/artifacts",
-                sub_path=artifact_subpath,
-            ),
-            client.V1VolumeMount(
-                name="state",
-                mount_path="/memory",
-                sub_path="memory",
-                read_only=True,
-            ),
-            client.V1VolumeMount(
-                name="state",
-                mount_path="/caches",
-                sub_path="caches",
-            ),
-        ],
+        volume_mounts=worker_volume_mounts,
     )
 
     pod_affinity = client.V1Affinity(
@@ -238,11 +261,18 @@ class K8sJobRunner:
             config.load_kube_config()
         self._batch = client.BatchV1Api()
 
-    async def spawn_job(self, record: IssueRecord, target: ProjectTargetConfig) -> str:
+    async def spawn_job(
+        self,
+        record: IssueRecord,
+        target: ProjectTargetConfig,
+        *,
+        worker_backend: str = "sdk",
+    ) -> str:
         manifest = build_triage_job_manifest(
             settings=self.settings,
             record=record,
             target=target,
+            worker_backend=worker_backend,
         )
         job_name = manifest.metadata.name
 
@@ -258,7 +288,13 @@ class K8sJobRunner:
                     raise
 
         await asyncio.to_thread(_create)
-        log.info("k8s_job.spawned", job_name=job_name, issue_id=record.issue_id, turn=record.turn)
+        log.info(
+            "k8s_job.spawned",
+            job_name=job_name,
+            issue_id=record.issue_id,
+            turn=record.turn,
+            worker_backend=worker_backend,
+        )
         return job_name
 
     async def get_job_terminal_state(self, issue_id: str, turn: int) -> str | None:

@@ -5,7 +5,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     build-essential \
-    && rm -rf /var/lib/apt/lists/*
+    dbus-x11 \
+    libsecret-tools \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin \
+    && chmod 0755 /usr/local/bin/agy
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
@@ -13,11 +17,11 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
 
-RUN uv pip install --system --no-cache "." \
+RUN uv pip install --system --no-cache ".[worker]" \
     && useradd -m -u 1000 agy \
-    && mkdir -p /work /session /artifacts \
-    && chown -R agy:agy /app /work /session /artifacts
+    && mkdir -p /work /session /artifacts /home/agy/.gemini \
+    && chown -R agy:agy /app /work /session /artifacts /home/agy
 
 USER 1000:1000
 WORKDIR /work
-CMD ["python3", "-m", "agy_cloud.cli"]
+CMD ["agent-tasks-worker"]

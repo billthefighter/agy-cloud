@@ -14,6 +14,7 @@ data:
       settle_seconds: 180
       min_events_bypass_settle: 2
       regression_cooldown_seconds: 3600
+      worker_backend: sdk
 
     projects:
       python-fastapi:
@@ -53,6 +54,8 @@ data:
       default_branch: main
       focus_subdir: ""
       verify_hint: "cd rattlsnek && uv sync --package edge --package edge_utils && uv run ruff check . && uv run ty check"
+      worker_backend: sdk
+      handoff_worker_backend: agy_cli
 
     ci_healer:
       enabled: true
@@ -60,6 +63,7 @@ data:
       lookback_hours: 6
       settle_seconds: 90
       cooldown_seconds: 3600
+      worker_backend: sdk
       repos:
         - github_repo: lodbrok-app/rattlsnek
           default_branch: main
@@ -83,6 +87,7 @@ data:
       github_repo: lodbrok-app/rattlsnek
       default_branch: main
       verify_hint: "cd rattlsnek && uv run ruff check ."
+      worker_backend: sdk
 
     dep_upgrader:
       enabled: true
@@ -90,6 +95,7 @@ data:
       github_repo: lodbrok-app/rattlsnek
       default_branch: main
       verify_hint: "cd rattlsnek && uv sync --package edge --package edge_utils && uv run ruff check edge edge_utils && uv run pytest edge edge_utils"
+      worker_backend: sdk
 
     channels:
       sentry: ""

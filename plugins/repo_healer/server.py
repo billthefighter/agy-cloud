@@ -20,6 +20,7 @@ class RepoHealerConfig(BaseModel):
     default_branch: str = "main"
     verify_hint: str = "uv run pytest"
     default_model: str = "gemini-4-hydrogen"
+    worker_backend: str = "sdk"
 
 
 class RepoHealerPlugin(AgyCloudPlugin[RepoHealerConfig]):
@@ -49,6 +50,7 @@ class RepoHealerPlugin(AgyCloudPlugin[RepoHealerConfig]):
                 verify_hint=self.ctx.config.verify_hint,
                 prompt=prompt,
                 model=model,
+                worker_backend=self.ctx.config.worker_backend,  # type: ignore[arg-type]
             )
         )
         return (

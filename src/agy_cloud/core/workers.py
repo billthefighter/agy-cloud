@@ -40,6 +40,52 @@ def build_k8s_worker_job_dict(
         "agy.cloud/turn": str(spec.turn),
     }
 
+    use_agy_cli = spec.worker_backend == "agy_cli"
+    worker_env: list[dict[str, str]] = [
+        {"name": "TASK_ID", "value": spec.task_id},
+        {"name": "SHORT_ID", "value": spec.short_id},
+        {"name": "PLUGIN_ID", "value": spec.plugin_id},
+        {"name": "GITHUB_REPO", "value": spec.github_repo},
+        {"name": "WORKER_BACKEND", "value": spec.worker_backend},
+        {"name": "WORKER_MODEL", "value": spec.model},
+        {"name": "TURN", "value": str(spec.turn)},
+        {"name": "CONVERSATION_ID", "value": spec.conversation_id or ""},
+        {"name": "FOCUS_SUBDIR", "value": spec.focus_subdir},
+        {"name": "VERIFY_HINT", "value": spec.verify_hint},
+        {"name": "WORK_DIR", "value": "/work"},
+        {"name": "SESSION_DIR", "value": "/session"},
+        {"name": "ARTIFACTS_DIR", "value": "/artifacts"},
+    ]
+    if use_agy_cli:
+        worker_env.extend(
+            [
+                {"name": "HOME", "value": "/home/agy"},
+                {"name": "TZ", "value": "UTC"},
+            ]
+        )
+
+    worker_mounts: list[dict[str, Any]] = [
+        {"name": "work", "mountPath": "/work"},
+        {
+            "name": "state",
+            "mountPath": "/session",
+            "subPath": session_subpath,
+        },
+        {
+            "name": "state",
+            "mountPath": "/artifacts",
+            "subPath": artifact_subpath,
+        },
+    ]
+    if use_agy_cli:
+        worker_mounts.append(
+            {
+                "name": "state",
+                "mountPath": "/home/agy/.gemini",
+                "subPath": "agy-auth",
+            }
+        )
+
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -96,34 +142,16 @@ def build_k8s_worker_job_dict(
                         {
                             "name": "agy-worker",
                             "image": cfg.worker_image,
-                            "env": [
-                                {"name": "TASK_ID", "value": spec.task_id},
-                                {"name": "SHORT_ID", "value": spec.short_id},
-                                {"name": "PLUGIN_ID", "value": spec.plugin_id},
-                                {"name": "GITHUB_REPO", "value": spec.github_repo},
-                                {"name": "WORKER_MODEL", "value": spec.model},
-                                {"name": "TURN", "value": str(spec.turn)},
-                                {"name": "CONVERSATION_ID", "value": spec.conversation_id or ""},
-                                {"name": "FOCUS_SUBDIR", "value": spec.focus_subdir},
-                                {"name": "VERIFY_HINT", "value": spec.verify_hint},
-                                {"name": "WORK_DIR", "value": "/work"},
-                                {"name": "SESSION_DIR", "value": "/session"},
-                                {"name": "ARTIFACTS_DIR", "value": "/artifacts"},
-                            ],
-                            "envFrom": [{"secretRef": {"name": cfg.worker_secret_name}}],
-                            "volumeMounts": [
-                                {"name": "work", "mountPath": "/work"},
+                            "env": worker_env,
+                            "envFrom": [
                                 {
-                                    "name": "state",
-                                    "mountPath": "/session",
-                                    "subPath": session_subpath,
-                                },
-                                {
-                                    "name": "state",
-                                    "mountPath": "/artifacts",
-                                    "subPath": artifact_subpath,
-                                },
+                                    "secretRef": {
+                                        "name": cfg.worker_secret_name,
+                                        "optional": use_agy_cli,
+                                    }
+                                }
                             ],
+                            "volumeMounts": worker_mounts,
                         }
                     ],
                     "volumes": [

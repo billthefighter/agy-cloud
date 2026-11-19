@@ -236,6 +236,7 @@ class _HandoffCreateRequest(BaseModel):
     verify_hint: str = ""
     focus_subdir: str = ""
     model: str = ""
+    worker_backend: str = ""
     title: str = ""
     source_conversation_id: str = ""
 
@@ -1677,6 +1678,9 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
             "verify_hint": body.verify_hint.strip(),
             "focus_subdir": body.focus_subdir.strip(),
             "model": selected_model or gateway.settings.worker_model,
+            "worker_backend": (
+                body.worker_backend.strip() or targets.slack_coding.handoff_worker_backend
+            ),
             "title": first_line,
             "source_conversation_id": body.source_conversation_id.strip(),
             "created_at": datetime.now(UTC).isoformat(),

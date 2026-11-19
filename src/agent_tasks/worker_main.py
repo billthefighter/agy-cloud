@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import subprocess
+import tempfile
 from pathlib import Path
+from typing import Any
 
 import structlog
 
-from agent_tasks.common.config import resolve_gemini_auth
+from agent_tasks.common.config import (
+    normalize_worker_backend,
+    resolve_gemini_auth,
+    resolve_worker_model_for_cli,
+)
 from agent_tasks.common.memory import load_worker_memory_context
 from agent_tasks.common.models import TokenUsageSummary, TriageReport, WorkerEnvelope
 
@@ -129,29 +136,140 @@ def _capture_git_diff(work_dir: Path) -> tuple[str, str]:
     return diff_proc.stdout, stat_proc.stdout.strip()
 
 
-async def run_worker() -> None:
-    # Imported lazily so controller unit tests run without compiled worker binary wheels.
+def _parse_agy_cli_json(stdout_text: str) -> dict[str, Any]:
+    """Parse JSON output emitted by `agy -p ... --output-format json`."""
+    cleaned = stdout_text.strip()
+    if not cleaned:
+        raise RuntimeError("`agy` CLI produced empty stdout.")
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    for line in reversed(cleaned.splitlines()):
+        candidate = line.strip()
+        if not candidate.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            continue
+    raise RuntimeError(f"Could not parse JSON response from `agy` CLI: {cleaned[:400]}")
+
+
+async def _run_agy_cli_worker(
+    *,
+    prompt: str,
+    effective_instructions: str,
+    worker_model: str,
+    work_dir: Path,
+    turn: int,
+    existing_conv_id: str | None,
+    timeout_seconds: int,
+) -> tuple[TriageReport | None, str, str, TokenUsageSummary, str]:
+    """Execute a worker turn via the authenticated `agy` CLI (Google account subscription)."""
+    cli_bin = os.environ.get("AGY_CLI_BIN", "agy").strip() or "agy"
+    cli_model = resolve_worker_model_for_cli(worker_model)
+
+    full_prompt = (
+        f"<system_instructions>\n{effective_instructions}\n</system_instructions>\n\n{prompt}"
+        if turn == 1 or not existing_conv_id
+        else prompt
+    )
+
+    schema_json = json.dumps(TriageReport.model_json_schema())
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", prefix="agy-triage-schema-", delete=False, encoding="utf-8"
+    ) as schema_file:
+        schema_file.write(schema_json)
+        schema_path = Path(schema_file.name)
+
+    try:
+        cmd = [
+            cli_bin,
+            "-p",
+            full_prompt,
+            "--output-format",
+            "json",
+            "--json-schema",
+            str(schema_path),
+            "--model",
+            cli_model,
+            "--dangerously-skip-permissions",
+            "--disable-slash-commands",
+        ]
+        if turn > 1 and existing_conv_id:
+            cmd.extend(["--conversation", existing_conv_id])
+
+        cli_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in {"GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTIGRAVITY_API_KEY"}
+        }
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(work_dir),
+            env=cli_env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout_seconds
+            )
+        except TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            raise
+
+        stdout_text = stdout_b.decode("utf-8", errors="replace")
+        stderr_text = stderr_b.decode("utf-8", errors="replace")
+        if proc.returncode != 0:
+            err_excerpt = (stderr_text.strip() or stdout_text.strip())[:800]
+            raise RuntimeError(f"agy CLI exited with code {proc.returncode}: {err_excerpt}")
+
+        payload = _parse_agy_cli_json(stdout_text)
+        raw_structured = payload.get("structured_output")
+        if raw_structured is None and isinstance(payload.get("response"), str):
+            try:
+                raw_structured = json.loads(payload["response"])
+            except json.JSONDecodeError:
+                raw_structured = None
+
+        report = TriageReport.model_validate(raw_structured) if raw_structured else None
+        conv_id = str(payload.get("conversation_id") or existing_conv_id or "")
+        stop_reason = str(payload.get("status") or "SUCCESS")
+        raw_usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+        usage_summary = TokenUsageSummary(
+            prompt_tokens=int(raw_usage.get("input_tokens", 0) or 0),
+            cached_tokens=int(raw_usage.get("cache_read_tokens", 0) or 0),
+            output_tokens=int(raw_usage.get("output_tokens", 0) or 0),
+            thoughts_tokens=int(raw_usage.get("thinking_tokens", 0) or 0),
+            total_tokens=int(raw_usage.get("total_tokens", 0) or 0),
+        )
+        return report, conv_id, stop_reason, usage_summary, cli_model
+    finally:
+        schema_path.unlink(missing_ok=True)
+
+
+async def _run_sdk_worker(
+    *,
+    prompt: str,
+    effective_instructions: str,
+    worker_model: str,
+    work_dir: Path,
+    session_dir: Path,
+    turn: int,
+    existing_conv_id: str | None,
+    timeout_seconds: int,
+) -> tuple[TriageReport | None, str, str, TokenUsageSummary, str]:
+    """Execute a worker turn via the `google-antigravity` Python SDK (`GEMINI_API_KEY`)."""
     from google.antigravity import Agent, LocalAgentConfig, types
     from google.antigravity.hooks import policy
 
-    issue_id = os.environ["ISSUE_ID"]
-    short_id = os.environ.get("SHORT_ID", issue_id)
-    project_slug = os.environ.get("PROJECT_SLUG", "")
-    turn = int(os.environ.get("TURN", "1"))
-    existing_conv_id = os.environ.get("CONVERSATION_ID") or None
-    focus_subdir = os.environ.get("FOCUS_SUBDIR", "")
-    verify_hint = os.environ.get("VERIFY_HINT", "")
-
-    work_dir = Path(os.environ.get("WORK_DIR", "/work"))
-    session_dir = Path(os.environ.get("SESSION_DIR", "/session"))
-    artifacts_dir = Path(os.environ.get("ARTIFACTS_DIR", "/artifacts"))
-    memory_dir = Path(os.environ.get("MEMORY_DIR", "/memory"))
-    github_repo = os.environ.get("GITHUB_REPO", "")
-    session_dir.mkdir(parents=True, exist_ok=True)
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
-
-    # Block git push / remote tampering even inside the disposable pod; Kubernetes pod +
-    # NetworkPolicy provides container/network isolation, so leave OS userns sandbox False.
     policies = [
         policy.deny(
             "run_command",
@@ -165,9 +283,6 @@ async def run_worker() -> None:
     ]
 
     api_key, use_vertex = resolve_gemini_auth(os.environ)
-    worker_model = (os.environ.get("WORKER_MODEL") or "gemini-4-hydrogen").strip()
-    effective_instructions = build_effective_system_instructions(memory_dir, github_repo)
-
     agent_cfg = LocalAgentConfig(
         model=worker_model,
         api_key=api_key,
@@ -189,6 +304,50 @@ async def run_worker() -> None:
         ),
     )
 
+    usage_summary = TokenUsageSummary()
+    async with asyncio.timeout(timeout_seconds), Agent(agent_cfg) as agent:
+        response = await agent.chat(prompt)
+        raw_report = await response.structured_output()
+        stop_reason = (
+            str(response.stop_reason.name)
+            if getattr(response, "stop_reason", None) is not None
+            else "UNSPECIFIED"
+        )
+        conv_id = str(agent.conversation_id)
+        raw_usage = getattr(getattr(agent, "conversation", None), "total_usage", None)
+        if raw_usage is not None:
+            usage_summary = TokenUsageSummary(
+                prompt_tokens=int(getattr(raw_usage, "prompt_token_count", 0) or 0),
+                cached_tokens=int(getattr(raw_usage, "cached_content_token_count", 0) or 0),
+                output_tokens=int(getattr(raw_usage, "candidates_token_count", 0) or 0),
+                thoughts_tokens=int(getattr(raw_usage, "thoughts_token_count", 0) or 0),
+                total_tokens=int(getattr(raw_usage, "total_token_count", 0) or 0),
+            )
+    report = TriageReport.model_validate(raw_report) if raw_report else None
+    return report, conv_id, stop_reason, usage_summary, worker_model
+
+
+async def run_worker() -> None:
+    issue_id = os.environ["ISSUE_ID"]
+    short_id = os.environ.get("SHORT_ID", issue_id)
+    project_slug = os.environ.get("PROJECT_SLUG", "")
+    turn = int(os.environ.get("TURN", "1"))
+    existing_conv_id = os.environ.get("CONVERSATION_ID") or None
+    focus_subdir = os.environ.get("FOCUS_SUBDIR", "")
+    verify_hint = os.environ.get("VERIFY_HINT", "")
+
+    work_dir = Path(os.environ.get("WORK_DIR", "/work"))
+    session_dir = Path(os.environ.get("SESSION_DIR", "/session"))
+    artifacts_dir = Path(os.environ.get("ARTIFACTS_DIR", "/artifacts"))
+    memory_dir = Path(os.environ.get("MEMORY_DIR", "/memory"))
+    github_repo = os.environ.get("GITHUB_REPO", "")
+    session_dir.mkdir(parents=True, exist_ok=True)
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    worker_backend = normalize_worker_backend(os.environ.get("WORKER_BACKEND")) or "sdk"
+    worker_model = (os.environ.get("WORKER_MODEL") or "gemini-4-hydrogen").strip()
+    effective_instructions = build_effective_system_instructions(memory_dir, github_repo)
+
     prompt = _build_prompt(
         artifacts_dir=artifacts_dir,
         turn=turn,
@@ -206,31 +365,34 @@ async def run_worker() -> None:
         short_id=short_id,
         turn=turn,
         model=worker_model,
-        vertex=use_vertex,
+        worker_backend=worker_backend,
         timeout_seconds=timeout_seconds,
     )
-    usage_summary = TokenUsageSummary()
     try:
-        async with asyncio.timeout(timeout_seconds), Agent(agent_cfg) as agent:
-            response = await agent.chat(prompt)
-            raw_report = await response.structured_output()
-            stop_reason = (
-                str(response.stop_reason.name)
-                if getattr(response, "stop_reason", None) is not None
-                else "UNSPECIFIED"
-            )
-            conv_id = str(agent.conversation_id)
-            raw_usage = getattr(getattr(agent, "conversation", None), "total_usage", None)
-            if raw_usage is not None:
-                usage_summary = TokenUsageSummary(
-                    prompt_tokens=int(getattr(raw_usage, "prompt_token_count", 0) or 0),
-                    cached_tokens=int(getattr(raw_usage, "cached_content_token_count", 0) or 0),
-                    output_tokens=int(getattr(raw_usage, "candidates_token_count", 0) or 0),
-                    thoughts_tokens=int(getattr(raw_usage, "thoughts_token_count", 0) or 0),
-                    total_tokens=int(getattr(raw_usage, "total_token_count", 0) or 0),
+        if worker_backend == "agy_cli":
+            report, conv_id, stop_reason, usage_summary, effective_model = (
+                await _run_agy_cli_worker(
+                    prompt=prompt,
+                    effective_instructions=effective_instructions,
+                    worker_model=worker_model,
+                    work_dir=work_dir,
+                    turn=turn,
+                    existing_conv_id=existing_conv_id,
+                    timeout_seconds=timeout_seconds,
                 )
+            )
+        else:
+            report, conv_id, stop_reason, usage_summary, effective_model = await _run_sdk_worker(
+                prompt=prompt,
+                effective_instructions=effective_instructions,
+                worker_model=worker_model,
+                work_dir=work_dir,
+                session_dir=session_dir,
+                turn=turn,
+                existing_conv_id=existing_conv_id,
+                timeout_seconds=timeout_seconds,
+            )
 
-        report = TriageReport.model_validate(raw_report) if raw_report else None
         diff_text, diff_stats = _capture_git_diff(work_dir)
         patch_path = artifacts_dir / "fix.patch"
         patch_path.write_text(diff_text, encoding="utf-8")
@@ -239,7 +401,8 @@ async def run_worker() -> None:
             issue_id=issue_id,
             turn=turn,
             conversation_id=conv_id,
-            model=worker_model,
+            model=effective_model,
+            worker_backend=worker_backend,
             stop_reason=stop_reason,
             has_patch=bool(diff_text.strip()),
             patch_stats=diff_stats,
@@ -253,6 +416,7 @@ async def run_worker() -> None:
             "worker.completed",
             issue_id=issue_id,
             turn=turn,
+            worker_backend=worker_backend,
             has_patch=envelope.has_patch,
             stop_reason=stop_reason,
             total_tokens=usage_summary.total_tokens,
@@ -264,6 +428,8 @@ async def run_worker() -> None:
             issue_id=issue_id,
             turn=turn,
             conversation_id=existing_conv_id or "",
+            model=worker_model,
+            worker_backend=worker_backend,
             error=err_detail,
         )
         (artifacts_dir / "result.json").write_text(

@@ -59,6 +59,7 @@ class HandoffCreateRequest(BaseModel):
     verify_hint: str = ""
     focus_subdir: str = ""
     model: str = "gemini-4-hydrogen"
+    worker_backend: str = "agy_cli"
     local_conversation_id: str | None = None
     workspace_path: str = ""
 
@@ -411,6 +412,9 @@ class HandoffService:
         )
         self.store.create(rec)
 
+        handoff_backend = (
+            "sdk" if (req.worker_backend or "").strip().lower() in {"sdk", "api_key", "api"} else "agy_cli"
+        )
         await self.jobs.spawn_agent_job(
             JobSpec(
                 task_id=handoff_id,
@@ -424,6 +428,7 @@ class HandoffService:
                 verify_hint=req.verify_hint,
                 prompt=prompt_md,
                 model=rec.model,
+                worker_backend=handoff_backend,
                 turn=1,
             )
         )
@@ -499,6 +504,7 @@ class HandoffService:
                 verify_hint=rec.verify_hint,
                 prompt=body.feedback.strip(),
                 model=new_model,
+                worker_backend="agy_cli",
                 turn=next_turn,
                 conversation_id=rec.remote_conversation_id,
             )

@@ -42,7 +42,10 @@ def repo_root() -> Path:
 
 @pytest.fixture()
 def external_health_plugins_repo() -> Path:
-    return Path("/Users/lucaswhipple/Dropbox/code_projects/agy-cloud-private-plugins")
+    repo_path = Path("/Users/lucaswhipple/Dropbox/code_projects/agy-cloud-private-plugins")
+    if not repo_path.is_dir():
+        pytest.skip(f"Local private plugins repo not present at {repo_path}")
+    return repo_path
 
 
 async def test_git_repo_plugin_loading_and_4_layer_config_override(

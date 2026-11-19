@@ -159,6 +159,7 @@ class WorkerEnvelope(pydantic.BaseModel):
     turn: int
     conversation_id: str
     model: str = ""
+    worker_backend: str = "sdk"
     stop_reason: str = "UNSPECIFIED"
     has_patch: bool = False
     patch_stats: str = ""

@@ -19,6 +19,7 @@ from agent_tasks.common.config import (
     ProjectTargetConfig,
     TargetsConfig,
     parse_model_override,
+    resolve_worker_backend,
 )
 from agent_tasks.common.dedup import (
     compute_sentry_dedup_key,
@@ -881,9 +882,31 @@ class SentryTriageTask:
 
                     (self.settings.state_dir / "caches" / "uv").mkdir(parents=True, exist_ok=True)
                     (self.settings.state_dir / "caches" / "npm").mkdir(parents=True, exist_ok=True)
+                    (self.settings.state_dir / "agy-auth").mkdir(parents=True, exist_ok=True)
                     self.memory.ensure_dirs()
                     self.session_dir(record.issue_id)
                     art_dir = self.artifact_dir(record.issue_id)
+
+                    is_handoff = False
+                    handoff_backend_override: str | None = None
+                    meta_file = art_dir / "handoff_meta.json"
+                    if meta_file.exists():
+                        try:
+                            meta_obj = json.loads(meta_file.read_text(encoding="utf-8"))
+                            if isinstance(meta_obj, dict):
+                                is_handoff = bool(meta_obj.get("is_handoff"))
+                                raw_b = meta_obj.get("worker_backend")
+                                if isinstance(raw_b, str) and raw_b.strip():
+                                    handoff_backend_override = raw_b.strip()
+                        except (OSError, json.JSONDecodeError):
+                            pass
+
+                    worker_backend = resolve_worker_backend(
+                        targets,
+                        task_kind=record.task_kind,
+                        is_handoff=is_handoff,
+                        override=handoff_backend_override,
+                    )
 
                     if record.task_kind == "sentry" and record.turn == 1:
                         bundle_file = art_dir / "issue_bundle.json"
@@ -915,7 +938,12 @@ class SentryTriageTask:
                     if result_file.exists():
                         result_file.unlink()
 
-                    await self.job_runner.spawn_job(record, target)
+                    try:
+                        await self.job_runner.spawn_job(
+                            record, target, worker_backend=worker_backend
+                        )
+                    except TypeError:
+                        await self.job_runner.spawn_job(record, target)
                     self.state.mark_status(record.issue_id, IssueStatus.RUNNING)
                     spawned += 1
                 except Exception as exc:
@@ -961,9 +989,11 @@ class SentryTriageTask:
                 or self.settings.worker_model
             )
             turn_cost = 0.0
+            is_account_billed = envelope is not None and envelope.worker_backend == "agy_cli"
             if (
                 self.billing_guard is not None
                 and envelope is not None
+                and not is_account_billed
                 and envelope.usage.total_tokens > 0
             ):
                 turn_cost = await self.billing_guard.record_worker_turn(
@@ -1092,12 +1122,19 @@ class SentryTriageTask:
                         banner_note=merged_banner,
                     )
 
-                cost_line = (
-                    f"Cost: `${turn_cost:.4f}` (`{envelope.usage.prompt_tokens:,}` in / "
-                    f"`{envelope.usage.output_tokens + envelope.usage.thoughts_tokens:,}` out+think) • "
-                    if envelope.usage.total_tokens > 0
-                    else ""
-                )
+                if is_account_billed:
+                    cost_line = (
+                        f"Auth: `agy` account (`{envelope.usage.total_tokens:,}` tok) • "
+                        if envelope.usage.total_tokens > 0
+                        else "Auth: `agy` account • "
+                    )
+                else:
+                    cost_line = (
+                        f"Cost: `${turn_cost:.4f}` (`{envelope.usage.prompt_tokens:,}` in / "
+                        f"`{envelope.usage.output_tokens + envelope.usage.thoughts_tokens:,}` out+think) • "
+                        if envelope.usage.total_tokens > 0
+                        else ""
+                    )
                 thread_ts = await self.channel.post_triage_result(
                     record=record,
                     report=report,
