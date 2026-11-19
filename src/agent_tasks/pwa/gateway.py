@@ -331,6 +331,13 @@ class _PushUnsubscribeRequest(BaseModel):
     endpoint: str
 
 
+class PendingFoodLog(BaseModel):
+    thread_ts: str
+    label: str
+    model: str = ""
+    started_at: str
+
+
 class _WsClientState:
     def __init__(self, ws: WebSocket) -> None:
         self.ws = ws
@@ -407,6 +414,7 @@ class PwaGatewayAdapter:
         self._ws_clients: list[_WsClientState] = []
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._food_log_sync_timeout_s: float = 15.0
+        self._pending_food_logs: dict[str, PendingFoodLog] = {}
 
     def _track_bg(self, coro: Any) -> asyncio.Task[Any]:
         task = asyncio.create_task(coro)
@@ -1064,6 +1072,7 @@ class PwaGatewayAdapter:
             "garmin_configured": self.food_task.garmin is not None,
             "garmin_settings": rt_settings,
             "readiness_warning": readiness_warning,
+            "pending_logs": [p.model_dump() for p in self._pending_food_logs.values()],
         }
 
     async def _run_direct_chat_turn_bg(
@@ -1630,8 +1639,8 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
         had_base_patch = bool(base_patch.strip())
 
         tokens: list[str] = []
-        if selected_model:
-            short_alias = selected_model.removeprefix("gemini-4-").removeprefix("gemini-3.8-")
+        if model_override:
+            short_alias = model_override.removeprefix("gemini-4-").removeprefix("gemini-3.8-")
             tokens.append(f"[{short_alias}]")
         if repo and not cleaned.lower().startswith("repo:"):
             tokens.append(f"repo:{repo}")
@@ -1992,6 +2001,7 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
         model: str = Form(default=""),
         staple_slug: str = Form(default=""),
         multiplier: float = Form(default=1.0),
+        async_mode: bool = Form(default=False),
         files: Annotated[list[UploadFile] | None, File()] = None,
     ) -> dict[str, Any]:
         if gateway.on_food_message is None:
@@ -2062,12 +2072,28 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
             return None, None, None
 
         t0 = time.monotonic()
-        backgrounded = False
+        enqueue_immediately = bool(async_mode and not staple_slug.strip())
+        backgrounded = enqueue_immediately
+        pending_label = text.strip() or (
+            f"{len(image_dicts)} meal photo(s)" if image_dicts else staple_slug.strip() or "Meal"
+        )
+        pending_model = (
+            model.strip().removeprefix("gemini-4-").removeprefix("gemini-3.8-")
+            if model.strip()
+            else ""
+        )
+        gateway._pending_food_logs[message_ts] = PendingFoodLog(
+            thread_ts=message_ts,
+            label=pending_label,
+            model=pending_model,
+            started_at=datetime.now(UTC).isoformat(),
+        )
         log.info(
             "pwa.food_log_started",
             thread_ts=message_ts,
             has_files=bool(image_dicts),
             is_staple=bool(staple_slug.strip()),
+            async_mode=enqueue_immediately,
         )
 
         async def _run_food_log() -> None:
@@ -2077,6 +2103,7 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
                     effective_text, "mobile", channel_id, message_ts, image_dicts, True
                 )
             except Exception as exc:
+                gateway._pending_food_logs.pop(message_ts, None)
                 log.exception(
                     "pwa.food_log_failed",
                     thread_ts=message_ts,
@@ -2094,6 +2121,7 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
                     )
                 return
 
+            gateway._pending_food_logs.pop(message_ts, None)
             logged, notice_msg, err_msg = _resolve_outcome()
             duration_ms = round((time.monotonic() - t0) * 1000)
             if err_msg:
@@ -2127,6 +2155,13 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
                 await gateway.broadcast("food.updated", ws_payload)
 
         task = gateway._track_bg(_run_food_log())
+        if enqueue_immediately:
+            log.info("pwa.food_log_enqueued", thread_ts=message_ts)
+            payload = gateway._build_food_today_payload()
+            payload["queued"] = True
+            payload["thread_ts"] = message_ts
+            return payload
+
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=gateway._food_log_sync_timeout_s)
         except TimeoutError:
@@ -2544,13 +2579,18 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
     if gateway.plugin_registry is not None:
         for pid, loaded in gateway.plugin_registry.plugins.items():
             granted = loaded.context.granted_permissions
-            p_router = loaded.plugin.get_api_router() if "api_router" in granted else None
-            if p_router is not None:
-                router.include_router(
-                    p_router,
-                    prefix=f"/api/plugins/{pid}",
-                    dependencies=[Depends(_require_auth)],
-                )
+            if "api_router" in granted:
+                contribution = loaded.plugin.get_gateway_contribution()
+                for route_spec in contribution.http_routes:
+                    sub_prefix = (
+                        "/" + route_spec.prefix.strip("/") if route_spec.prefix.strip("/") else ""
+                    )
+                    deps = [Depends(_require_auth)] if route_spec.require_auth else []
+                    router.include_router(
+                        route_spec.router,
+                        prefix=f"/api/plugins/{pid}{sub_prefix}",
+                        dependencies=deps,
+                    )
             if "pwa_views" in granted and loaded.source_dir is not None:
                 p_static = loaded.source_dir / "static"
                 if p_static.is_dir():

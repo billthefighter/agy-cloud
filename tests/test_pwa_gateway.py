@@ -539,6 +539,124 @@ def test_slow_food_log_backgrounds_and_broadcasts_completion(tmp_path: Path) -> 
         assert len(today["meals"]) == 1
 
 
+def test_async_mode_food_log_enqueues_immediately_and_tracks_pending(tmp_path: Path) -> None:
+    import asyncio
+    import time
+
+    class _SlowEstimator(FakeNutritionEstimator):
+        async def estimate_meal(self, **kwargs):
+            await asyncio.sleep(0.12)
+            return await super().estimate_meal(**kwargs)
+
+    _settings, _state, _push_mgr, gateway, _composite, app, _actions = _make_stack(tmp_path)
+    assert gateway.food_task is not None
+    gateway.food_task.estimator = _SlowEstimator()
+    gateway._food_log_sync_timeout_s = 15.0  # Would block 15s if not async_mode
+
+    with TestClient(app) as client:
+        login = client.post("/agy/api/auth/login", json={"token": "super-secret-pwa-token"})
+        assert login.status_code == 200
+
+        with client.websocket_connect("/agy/api/ws") as ws:
+            t0 = time.monotonic()
+            queued_resp = client.post(
+                "/agy/api/food/log",
+                headers={"X-AGY-Client": "pwa"},
+                data={"text": "Costco grain and celery salad", "async_mode": "true"},
+            )
+            elapsed = time.monotonic() - t0
+            assert queued_resp.status_code == 200
+            assert elapsed < 0.5
+            queued_data = queued_resp.json()
+            assert queued_data["queued"] is True
+            assert any(
+                p["thread_ts"] == queued_data["thread_ts"]
+                for p in queued_data.get("pending_logs", [])
+            )
+
+            deadline = time.monotonic() + 2.0
+            ws_event = None
+            while time.monotonic() < deadline:
+                msg = ws.receive_json()
+                if msg.get("type") == "food.updated" and msg.get("data", {}).get("meal_title"):
+                    ws_event = msg["data"]
+                    break
+            assert ws_event is not None
+            assert ws_event["thread_ts"] == queued_data["thread_ts"]
+
+        today = client.get("/agy/api/food/today").json()
+        assert len(today["meals"]) == 1
+        assert today["pending_logs"] == []
+
+
+def test_estimator_falls_back_on_timeout_and_503(monkeypatch) -> None:
+    import asyncio
+
+    from agent_tasks.common.models import TokenUsageSummary
+    from agent_tasks.tasks.food_tracker.estimator import AgyNutritionEstimator
+    from agent_tasks.tasks.food_tracker.models import EstimatedMealItem, MealEstimateSchema
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    estimator = AgyNutritionEstimator(
+        default_model="gemini-4-hydrogen",
+        attempt_timeout_s=0.05,
+        timeout_backoff_factor=2.0,
+        max_attempt_timeout_s=0.15,
+        fallback_models=("gemini-4-hydrogen", "gemini-3.8-flash", "gemini-4-neon"),
+    )
+    assert estimator._timeout_for_attempt(0) == 0.05
+    assert estimator._timeout_for_attempt(1) == 0.10
+    assert estimator._timeout_for_attempt(2) == 0.15
+    assert estimator._timeout_for_attempt(3) == 0.15
+
+    attempted: list[str] = []
+
+    async def _fake_single_model(*, model: str, **kwargs):
+        attempted.append(model)
+        if model == "gemini-4-hydrogen":
+            await asyncio.sleep(0.5)  # Simulates 15m SDK retry stall -> hits timeout
+        if model == "gemini-3.8-flash":
+            raise RuntimeError("Error 503, Message: This model is currently experiencing high demand.")
+        return (
+            MealEstimateSchema(
+                title="Costco Grain & Celery Salad",
+                meal_slot="lunch",
+                confidence="medium",
+                assumptions_note="1 serving with vinaigrette",
+                items=[
+                    EstimatedMealItem(
+                        name="Grain and celery salad",
+                        quantity_desc="1 bowl",
+                        estimated_grams=250.0,
+                        calories_kcal=360.0,
+                        protein_g=10.0,
+                        carbs_g=48.0,
+                        fat_g=14.0,
+                        fiber_g=7.0,
+                        source="vision_estimate",
+                    )
+                ],
+            ),
+            TokenUsageSummary(total_tokens=100),
+            model,
+        )
+
+    monkeypatch.setattr(estimator, "_run_single_model", _fake_single_model)
+
+    result, _usage, used_model = asyncio.run(
+        estimator.estimate_meal(
+            description="Costco grain and celery salad with apple cider vinaigrette",
+            photo_paths=[],
+            local_date="2026-11-18",
+            default_slot="lunch",
+            saved_foods=[],
+        )
+    )
+    assert attempted == ["gemini-4-hydrogen", "gemini-3.8-flash", "gemini-4-neon"]
+    assert used_model == "gemini-4-neon"
+    assert result.title == "Costco Grain & Celery Salad"
+
+
 def test_pwa_garmin_trends_settings_and_coach_health_context(tmp_path: Path) -> None:
     from agent_tasks.tasks.food_tracker.models import GarminActivityRecord, GarminDailyMetric
 

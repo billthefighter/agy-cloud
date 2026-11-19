@@ -11,6 +11,12 @@ from pydantic import BaseModel, Field
 
 from agy_cloud.core.handoff import HandoffService, HandoffStore, create_handoff_router
 from agy_cloud.core.loader import PluginRegistry
+from agy_cloud.sdk.gateway_contracts import (
+    EventSchemaSummary,
+    TransportAdapter,
+    TransportHealth,
+    TypedEventBus,
+)
 from agy_cloud.sdk.spec import (
     ButtonEvent,
     ChannelMessageEvent,
@@ -445,16 +451,31 @@ def create_microkernel_app(
             raise HTTPException(status_code=404, detail="Media file not found.")
         return FileResponse(candidate)
 
-    # Mount each plugin's custom APIRouter, isolated media dir, static dir, and standalone PWA views
+    # Mount each plugin's declarative GatewayContribution (HTTP routes, typed events, transports),
+    # isolated media dir, static dir, and standalone PWA views.
+    event_bus = TypedEventBus()
+    registered_transports: list[TransportAdapter] = []
+
     for pid, loaded in registry.plugins.items():
         granted = loaded.context.granted_permissions
-        plugin_router = loaded.plugin.get_api_router() if "api_router" in granted else None
-        if plugin_router is not None:
-            root_router.include_router(
-                plugin_router,
-                prefix=f"/api/plugins/{pid}",
-                tags=[f"plugin:{pid}"],
-            )
+        contribution = loaded.plugin.get_gateway_contribution()
+
+        if "api_router" in granted:
+            for route_spec in contribution.http_routes:
+                sub_prefix = (
+                    "/" + route_spec.prefix.strip("/") if route_spec.prefix.strip("/") else ""
+                )
+                route_tags = list(route_spec.tags) if route_spec.tags else [f"plugin:{pid}"]
+                root_router.include_router(
+                    route_spec.router,
+                    prefix=f"/api/plugins/{pid}{sub_prefix}",
+                    tags=route_tags,
+                )
+
+        for event_spec in contribution.events:
+            event_bus.register(pid, event_spec)
+
+        registered_transports.extend(contribution.transports)
 
         if "media" in granted:
 
@@ -518,6 +539,14 @@ def create_microkernel_app(
 
                     app.add_api_route(mount_p, _make_view_handler(view, pid), methods=["GET"])
                     app.add_api_route(f"{mount_p}/", _make_view_handler(view, pid), methods=["GET"])
+
+    @root_router.get("/api/events/schema", response_model=list[EventSchemaSummary])
+    async def list_event_schemas() -> list[EventSchemaSummary]:
+        return event_bus.list_schemas()
+
+    @root_router.get("/api/transports", response_model=list[TransportHealth])
+    async def list_transports() -> list[TransportHealth]:
+        return [await adapter.health() for adapter in registered_transports]
 
     app.include_router(root_router, prefix=clean_base)
     return app

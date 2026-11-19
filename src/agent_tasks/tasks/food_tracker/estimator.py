@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
 from typing import Any, Protocol
+
+import structlog
 
 from agent_tasks.common.config import DEFAULT_WORKER_MODEL, resolve_gemini_auth
 from agent_tasks.common.models import TokenUsageSummary, load_sdk_image
@@ -14,6 +17,37 @@ from agent_tasks.tasks.food_tracker.models import (
     MealSlot,
     SavedFood,
 )
+
+log = structlog.get_logger(__name__)
+
+DEFAULT_ATTEMPT_TIMEOUT_S = 20.0
+DEFAULT_TIMEOUT_BACKOFF_FACTOR = 2.0
+DEFAULT_MAX_ATTEMPT_TIMEOUT_S = 120.0
+FALLBACK_MODELS: tuple[str, ...] = (
+    "gemini-4-hydrogen",
+    "gemini-3.8-flash",
+    "gemini-4-neon",
+)
+
+
+def _is_retryable_model_error(exc: BaseException) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    msg = str(exc).lower()
+    return any(
+        marker in msg
+        for marker in (
+            "503",
+            "unavailable",
+            "high demand",
+            "429",
+            "resource_exhausted",
+            "overloaded",
+            "deadline",
+            "timed out",
+            "empty structured nutrition output",
+        )
+    )
 
 NUTRITION_SYSTEM_INSTRUCTIONS = """\
 You are a precision nutrition analyst estimating calories and macronutrients from meal photos,
@@ -100,27 +134,63 @@ def _extract_usage(agent: Any) -> TokenUsageSummary:
 class AgyNutritionEstimator:
     """In-controller multimodal Gemini estimator using the Google Antigravity SDK."""
 
-    def __init__(self, *, default_model: str = DEFAULT_WORKER_MODEL) -> None:
-        self.default_model = default_model
-
-    async def _run_agent(
+    def __init__(
         self,
         *,
-        prompt: str,
-        photo_paths: list[Path],
-        model_override: str | None,
+        default_model: str = DEFAULT_WORKER_MODEL,
+        attempt_timeout_s: float | None = None,
+        timeout_backoff_factor: float = DEFAULT_TIMEOUT_BACKOFF_FACTOR,
+        max_attempt_timeout_s: float | None = None,
+        fallback_models: tuple[str, ...] = FALLBACK_MODELS,
+    ) -> None:
+        self.default_model = default_model
+        if attempt_timeout_s is None:
+            raw_timeout = os.environ.get("FOOD_ESTIMATOR_TIMEOUT_S", "").strip()
+            try:
+                parsed = float(raw_timeout) if raw_timeout else DEFAULT_ATTEMPT_TIMEOUT_S
+            except ValueError:
+                parsed = DEFAULT_ATTEMPT_TIMEOUT_S
+            self.attempt_timeout_s = max(5.0, parsed)
+        else:
+            self.attempt_timeout_s = max(0.05, float(attempt_timeout_s))
+        self.timeout_backoff_factor = max(1.0, float(timeout_backoff_factor))
+        if max_attempt_timeout_s is None:
+            raw_max = os.environ.get("FOOD_ESTIMATOR_MAX_TIMEOUT_S", "").strip()
+            try:
+                parsed_max = float(raw_max) if raw_max else DEFAULT_MAX_ATTEMPT_TIMEOUT_S
+            except ValueError:
+                parsed_max = DEFAULT_MAX_ATTEMPT_TIMEOUT_S
+            self.max_attempt_timeout_s = max(self.attempt_timeout_s, parsed_max)
+        else:
+            self.max_attempt_timeout_s = max(self.attempt_timeout_s, float(max_attempt_timeout_s))
+        self.fallback_models = fallback_models
+
+    def _timeout_for_attempt(self, attempt_idx: int) -> float:
+        scaled = self.attempt_timeout_s * (self.timeout_backoff_factor**attempt_idx)
+        return min(self.max_attempt_timeout_s, scaled)
+
+    def _candidate_models(self, model_override: str | None) -> list[str]:
+        primary = (model_override or self.default_model).strip() or DEFAULT_WORKER_MODEL
+        ordered = [primary]
+        for candidate in self.fallback_models:
+            if candidate not in ordered:
+                ordered.append(candidate)
+        return ordered
+
+    async def _run_single_model(
+        self,
+        *,
+        model: str,
+        api_key: str | None,
+        use_vertex: bool,
+        payload: str | list[Any],
         response_schema: type[MealEstimateSchema] | None,
-        system_instructions: str = NUTRITION_SYSTEM_INSTRUCTIONS,
+        system_instructions: str,
     ) -> tuple[Any, TokenUsageSummary, str]:
         # Imported lazily so macOS unit tests run without Linux compiled worker wheels.
         from google.antigravity import Agent, LocalAgentConfig, types
         from google.antigravity.hooks import policy
 
-        api_key, use_vertex = resolve_gemini_auth(os.environ)
-        if api_key is None and not use_vertex:
-            raise RuntimeError("GEMINI_API_KEY is not configured on agent-tasks-controller.")
-
-        model = (model_override or self.default_model).strip() or DEFAULT_WORKER_MODEL
         agent_cfg = LocalAgentConfig(
             model=model,
             api_key=api_key,
@@ -146,20 +216,68 @@ class AgyNutritionEstimator:
             ),
         )
 
-        images = [load_sdk_image(p) for p in photo_paths]
-        payload: str | list[Any] = [prompt, *images] if images else prompt
-
         async with Agent(agent_cfg) as agent:
             response = await agent.chat(payload)
             if response_schema is not None:
                 raw = await response.structured_output()
                 if not raw:
-                    raise RuntimeError("Hydrogen returned empty structured nutrition output.")
+                    raise RuntimeError(f"{model} returned empty structured nutrition output.")
                 result: Any = response_schema.model_validate(raw)
             else:
                 result = (await response.text() or "").strip()
             usage = _extract_usage(agent)
             return result, usage, model
+
+    async def _run_agent(
+        self,
+        *,
+        prompt: str,
+        photo_paths: list[Path],
+        model_override: str | None,
+        response_schema: type[MealEstimateSchema] | None,
+        system_instructions: str = NUTRITION_SYSTEM_INSTRUCTIONS,
+    ) -> tuple[Any, TokenUsageSummary, str]:
+        api_key, use_vertex = resolve_gemini_auth(os.environ)
+        if api_key is None and not use_vertex:
+            raise RuntimeError("GEMINI_API_KEY is not configured on agent-tasks-controller.")
+
+        images = [load_sdk_image(p) for p in photo_paths]
+        payload: str | list[Any] = [prompt, *images] if images else prompt
+
+        candidates = self._candidate_models(model_override)
+        last_exc: BaseException | None = None
+        for idx, model in enumerate(candidates):
+            attempt_timeout = self._timeout_for_attempt(idx)
+            try:
+                return await asyncio.wait_for(
+                    self._run_single_model(
+                        model=model,
+                        api_key=api_key,
+                        use_vertex=use_vertex,
+                        payload=payload,
+                        response_schema=response_schema,
+                        system_instructions=system_instructions,
+                    ),
+                    timeout=attempt_timeout,
+                )
+            except Exception as exc:
+                last_exc = exc
+                has_next = idx + 1 < len(candidates)
+                if has_next and _is_retryable_model_error(exc):
+                    log.warning(
+                        "food_tracker.estimator_fallback",
+                        attempt=idx + 1,
+                        failed_model=model,
+                        next_model=candidates[idx + 1],
+                        timeout_s=attempt_timeout,
+                        next_timeout_s=self._timeout_for_attempt(idx + 1),
+                        error=type(exc).__name__ if isinstance(exc, TimeoutError) else str(exc),
+                    )
+                    continue
+                raise
+
+        assert last_exc is not None
+        raise last_exc
 
     async def estimate_meal(
         self,

@@ -156,6 +156,7 @@ button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  gap: 5px;
   min-width: 34px;
   height: 34px;
   padding: 0 10px;
@@ -164,6 +165,9 @@ button {
   border: 1px solid var(--border);
   font-size: 14px;
   font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .icon-btn.primary {

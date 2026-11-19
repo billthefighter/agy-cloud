@@ -8,6 +8,19 @@ from typing import Any, Literal, Protocol
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
+from agy_cloud.sdk.gateway_contracts import (
+    ChannelBusEventSink,
+    EventSpec,
+    GatewayContribution,
+    HttpContributor,
+    HttpRouteSpec,
+    InMemoryJobQueue,
+    JobQueueProtocol,
+    RealtimeContributor,
+    TransportAdapter,
+    TransportContributor,
+    TypedEventBus,
+)
 from agy_cloud.sdk.persistence import PluginDatabase, PluginKeyValueStore
 
 ALL_PLUGIN_PERMISSIONS: frozenset[str] = frozenset(
@@ -406,6 +419,8 @@ class PluginContext[ConfigT: BaseModel]:
         channels: ChannelBusProtocol,
         jobs: WorkerJobServiceProtocol,
         granted_permissions: set[str] | None = None,
+        async_jobs: JobQueueProtocol | None = None,
+        events: TypedEventBus | None = None,
     ) -> None:
         self.plugin_id = plugin_id
         self.manifest = manifest
@@ -415,6 +430,8 @@ class PluginContext[ConfigT: BaseModel]:
         self._services = services
         self._channels = channels
         self._jobs = jobs
+        self._async_jobs: JobQueueProtocol = async_jobs or InMemoryJobQueue()
+        self._events: TypedEventBus = events or TypedEventBus(sink=ChannelBusEventSink(channels))
         self.granted_permissions: set[str] = (
             set(granted_permissions)
             if granted_permissions is not None
@@ -440,6 +457,17 @@ class PluginContext[ConfigT: BaseModel]:
     def jobs(self) -> WorkerJobServiceProtocol:
         self.require_permission("k8s_jobs")
         return self._jobs
+
+    @property
+    def async_jobs(self) -> JobQueueProtocol:
+        """Host-managed in-process async job queue for non-blocking plugin work."""
+        return self._async_jobs
+
+    @property
+    def events(self) -> TypedEventBus:
+        """Typed realtime event bus backed by the gateway WebSocket sink."""
+        self.require_permission("channel_bus")
+        return self._events
 
     @property
     def data_dir(self) -> Path:
@@ -550,6 +578,32 @@ class AgyCloudPlugin[ConfigT: BaseModel]:
     def get_api_router(self) -> APIRouter | None:
         """Return an optional FastAPI APIRouter mounted at `/api/plugins/<plugin_id>`."""
         return None
+
+    def get_gateway_contribution(self) -> GatewayContribution:
+        """Return this plugin's declarative HTTP routes, typed event specs, and transport adapters.
+
+        By default, composes from `HttpContributor`, `RealtimeContributor`, `TransportContributor`,
+        and legacy `get_api_router()` so existing plugins require zero boilerplate.
+        """
+        http_routes: list[HttpRouteSpec] = []
+        if isinstance(self, HttpContributor):
+            http_routes.extend(self.get_http_routes())
+        else:
+            legacy_router = self.get_api_router()
+            if legacy_router is not None:
+                http_routes.append(HttpRouteSpec(router=legacy_router))
+
+        events: tuple[EventSpec[Any], ...] = (
+            self.get_event_specs() if isinstance(self, RealtimeContributor) else ()
+        )
+        transports: tuple[TransportAdapter, ...] = (
+            self.get_transports() if isinstance(self, TransportContributor) else ()
+        )
+        return GatewayContribution(
+            http_routes=tuple(http_routes),
+            events=events,
+            transports=transports,
+        )
 
     async def build_chat_context(
         self,
