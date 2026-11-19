@@ -37,6 +37,7 @@ from agent_tasks.common.state import IssueRecord, StateStore
 from agent_tasks.tasks.sentry_triage.git_ops import (
     create_draft_pull_request,
     push_patch_to_branch,
+    sync_agy_config_repo,
     sync_bare_mirror,
 )
 from agent_tasks.tasks.sentry_triage.k8s_jobs import K8sJobRunner
@@ -907,6 +908,24 @@ class SentryTriageTask:
                         is_handoff=is_handoff,
                         override=handoff_backend_override,
                     )
+                    if (
+                        worker_backend == "agy_cli"
+                        and targets.agy_config.enabled
+                        and targets.agy_config.github_repo.strip()
+                    ):
+                        try:
+                            await sync_agy_config_repo(
+                                self.settings.state_dir / "agy-auth",
+                                targets.agy_config.github_repo.strip(),
+                                self.settings.target_github_token,
+                                branch=targets.agy_config.branch.strip() or "main",
+                            )
+                        except Exception as cfg_exc:  # noqa: BLE001
+                            log.warning(
+                                "agy_config.sync_failed",
+                                repo=targets.agy_config.github_repo,
+                                error=str(cfg_exc),
+                            )
 
                     if record.task_kind == "sentry" and record.turn == 1:
                         bundle_file = art_dir / "issue_bundle.json"

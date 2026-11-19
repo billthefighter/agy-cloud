@@ -199,7 +199,6 @@ async def _run_agy_cli_worker(
             "--model",
             cli_model,
             "--dangerously-skip-permissions",
-            "--disable-slash-commands",
         ]
         if turn > 1 and existing_conv_id:
             cmd.extend(["--conversation", existing_conv_id])

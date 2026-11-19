@@ -308,6 +308,14 @@ class BillingConfig(pydantic.BaseModel):
     model_rates: dict[str, ModelRateConfig] = pydantic.Field(default_factory=default_model_rates)
 
 
+class AgyConfigSyncConfig(pydantic.BaseModel):
+    """Optional GitHub repo containing global AGY customizations (hooks, rules, skills, sidecars)."""
+
+    enabled: bool = True
+    github_repo: str = ""
+    branch: str = "main"
+
+
 class TargetsConfig(pydantic.BaseModel):
     sentry: SentryGlobalConfig = pydantic.Field(default_factory=SentryGlobalConfig)
     projects: dict[str, ProjectTargetConfig] = pydantic.Field(default_factory=dict)
@@ -315,6 +323,7 @@ class TargetsConfig(pydantic.BaseModel):
     ci_healer: CiHealerConfig = pydantic.Field(default_factory=CiHealerConfig)
     k8s_watchdog: K8sWatchdogConfig = pydantic.Field(default_factory=K8sWatchdogConfig)
     dep_upgrader: DepUpgraderConfig = pydantic.Field(default_factory=DepUpgraderConfig)
+    agy_config: AgyConfigSyncConfig = pydantic.Field(default_factory=AgyConfigSyncConfig)
     channels: ChannelRoutingConfig = pydantic.Field(default_factory=ChannelRoutingConfig)
     billing: BillingConfig = pydantic.Field(default_factory=BillingConfig)
     food_tracker: FoodTrackerConfig = pydantic.Field(default_factory=FoodTrackerConfig)

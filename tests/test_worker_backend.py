@@ -15,6 +15,7 @@ from agent_tasks.common.config import (
 )
 from agent_tasks.common.models import IssueStatus, WorkerEnvelope
 from agent_tasks.common.state import IssueRecord
+from agent_tasks.tasks.sentry_triage.git_ops import sync_agy_config_repo_sync
 from agent_tasks.tasks.sentry_triage.k8s_jobs import build_triage_job_manifest
 from agent_tasks.worker_main import run_worker
 from agy_cloud.core.gateway import MemoryChannelBus, RecordingWorkerJobService
@@ -225,3 +226,43 @@ print(json.dumps({
     assert envelope.usage.total_tokens == 1400
     patch_text = (artifacts_dir / "fix.patch").read_text(encoding="utf-8")
     assert "+after" in patch_text
+
+
+def test_sync_agy_config_repo_creates_relative_symlinks(tmp_path: Path) -> None:
+    import os
+
+    src_repo = tmp_path / "src_agy_config"
+    (src_repo / "hooks").mkdir(parents=True)
+    (src_repo / "hooks" / "runner.py").write_text("# runner\n", encoding="utf-8")
+    (src_repo / "hooks.json").write_text('{"agy-global-hooks": {}}\n', encoding="utf-8")
+    (src_repo / "skills" / "doomloop").mkdir(parents=True)
+    (src_repo / "skills" / "doomloop" / "SKILL.md").write_text("# doomloop\n", encoding="utf-8")
+    (src_repo / "rules").mkdir(parents=True)
+    (src_repo / "rules" / "stream_safety.md").write_text("# rules\n", encoding="utf-8")
+
+    subprocess.run(["git", "init", "-b", "main"], cwd=src_repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=src_repo, check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=src_repo, check=True)
+    subprocess.run(["git", "add", "."], cwd=src_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=src_repo, check=True, capture_output=True)
+
+    agy_auth = tmp_path / "agy-auth"
+    config_dir = sync_agy_config_repo_sync(agy_auth, str(src_repo), "", branch="main")
+
+    assert (config_dir / "hooks.json").is_symlink()
+    assert os.readlink(config_dir / "hooks.json") == "../agy-config/hooks.json"
+    assert (config_dir / "hooks").is_symlink()
+    assert os.readlink(config_dir / "hooks") == "../agy-config/hooks"
+    assert os.readlink(config_dir / "skills" / "doomloop") == "../../agy-config/skills/doomloop"
+    assert (
+        os.readlink(config_dir / "rules" / "stream_safety.md")
+        == "../../agy-config/rules/stream_safety.md"
+    )
+    assert (agy_auth / "antigravity" / "hook_state").is_dir()
+
+    # Re-sync idempotently after removing a skill
+    subprocess.run(["git", "rm", "-r", "skills/doomloop"], cwd=src_repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "rm skill"], cwd=src_repo, check=True, capture_output=True)
+    sync_agy_config_repo_sync(agy_auth, str(src_repo), "", branch="main")
+    assert not (config_dir / "skills" / "doomloop").exists()
+    assert not (config_dir / "skills" / "doomloop").is_symlink()

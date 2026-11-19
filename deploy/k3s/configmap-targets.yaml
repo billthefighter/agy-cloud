@@ -97,6 +97,11 @@ data:
       verify_hint: "cd rattlsnek && uv sync --package edge --package edge_utils && uv run ruff check edge edge_utils && uv run pytest edge edge_utils"
       worker_backend: sdk
 
+    agy_config:
+      enabled: true
+      github_repo: billthefighter/agy-config
+      branch: main
+
     channels:
       sentry: ""
       ci: ""

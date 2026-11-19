@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import os
 import re
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -19,6 +21,142 @@ log = structlog.get_logger(__name__)
 def _github_basic_auth_header(token: str) -> str:
     encoded = base64.b64encode(f"x-access-token:{token}".encode()).decode("ascii")
     return f"AUTHORIZATION: basic {encoded}"
+
+
+def _ensure_relative_symlink(link_path: Path, target_path: Path) -> None:
+    """Create or update a relative symlink so it resolves identically across mount paths."""
+    link_path.parent.mkdir(parents=True, exist_ok=True)
+    rel_target = os.path.relpath(target_path, start=link_path.parent)
+    if link_path.is_symlink():
+        if os.readlink(link_path) == rel_target:
+            return
+        link_path.unlink()
+    elif link_path.exists():
+        if link_path.is_dir():
+            shutil.rmtree(link_path)
+        else:
+            link_path.unlink()
+    link_path.symlink_to(rel_target)
+
+
+def sync_agy_config_repo_sync(
+    agy_auth_root: Path,
+    github_repo: str,
+    github_token: str,
+    *,
+    branch: str = "main",
+) -> Path:
+    """Clone or update an `agy-config` repo into `<agy_auth_root>/agy-config` and wire relative
+    symlinks into `<agy_auth_root>/config/` WITHOUT persisting credentials into git config.
+
+    Because `<agy_auth_root>` (`/state/agy-auth` in controller) is mounted as `/home/agy/.gemini`
+    inside `agy_cli` worker pods, relative symlinks (`../agy-config/hooks`, etc.) resolve cleanly
+    in both controller and ephemeral worker pods.
+    """
+    agy_auth_root.mkdir(parents=True, exist_ok=True)
+    repo_dir = agy_auth_root / "agy-config"
+    is_local_source = github_repo.startswith("/") or github_repo.startswith("file://")
+    clean_url = github_repo if is_local_source else f"https://github.com/{github_repo}.git"
+    auth_args = (
+        ["-c", f"http.https://github.com/.extraheader={_github_basic_auth_header(github_token)}"]
+        if (github_token and not is_local_source)
+        else []
+    )
+
+    if not (repo_dir / ".git").exists():
+        if repo_dir.exists():
+            shutil.rmtree(repo_dir)
+        log.info("agy_config.cloning", repo=github_repo, branch=branch, path=str(repo_dir))
+        subprocess.run(
+            [
+                "git",
+                *auth_args,
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                branch,
+                clean_url,
+                str(repo_dir),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    else:
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "remote", "set-url", "origin", clean_url],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                *auth_args,
+                "-C",
+                str(repo_dir),
+                "fetch",
+                "--depth",
+                "1",
+                "origin",
+                branch,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "reset", "--hard", "FETCH_HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    config_dir = agy_auth_root / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (agy_auth_root / "antigravity" / "hook_state").mkdir(parents=True, exist_ok=True)
+
+    if (repo_dir / "hooks.json").is_file():
+        _ensure_relative_symlink(config_dir / "hooks.json", repo_dir / "hooks.json")
+    if (repo_dir / "hooks").is_dir():
+        _ensure_relative_symlink(config_dir / "hooks", repo_dir / "hooks")
+
+    for subdir_name, want_dir in (("skills", True), ("sidecars", True), ("rules", False)):
+        src_parent = repo_dir / subdir_name
+        dst_parent = config_dir / subdir_name
+        expected_names: set[str] = set()
+        if src_parent.is_dir():
+            dst_parent.mkdir(parents=True, exist_ok=True)
+            for entry in sorted(src_parent.iterdir()):
+                if entry.name.startswith("."):
+                    continue
+                if (want_dir and entry.is_dir()) or (not want_dir and entry.is_file()):
+                    expected_names.add(entry.name)
+                    _ensure_relative_symlink(dst_parent / entry.name, entry)
+        if dst_parent.is_dir():
+            for existing in list(dst_parent.iterdir()):
+                if existing.is_symlink() and existing.name not in expected_names:
+                    existing.unlink()
+
+    log.info("agy_config.synced", repo=github_repo, branch=branch, config_dir=str(config_dir))
+    return config_dir
+
+
+async def sync_agy_config_repo(
+    agy_auth_root: Path,
+    github_repo: str,
+    github_token: str,
+    *,
+    branch: str = "main",
+) -> Path:
+    return await asyncio.to_thread(
+        sync_agy_config_repo_sync,
+        agy_auth_root,
+        github_repo,
+        github_token,
+        branch=branch,
+    )
 
 
 def mirror_dir_for_repo(mirrors_root: Path, github_repo: str) -> Path:
