@@ -152,6 +152,113 @@ class _BusButtonRequest(BaseModel):
     extra: dict[str, Any] = Field(default_factory=dict)
 
 
+def build_ui_manifest(
+    registry: PluginRegistry | None,
+    *,
+    base_path: str = "",
+    include_core_defaults: bool = True,
+) -> dict[str, Any]:
+    """Build the declarative UI bootstrap manifest consumed by the lightweight PWA shell."""
+    clean_base = "/" + base_path.strip("/") if base_path.strip("/") else ""
+    push_categories: list[dict[str, Any]] = []
+    seen_push: set[str] = set()
+    thread_kinds: list[dict[str, Any]] = []
+    seen_kinds: set[str] = set()
+    exclude_inbox_kinds: list[str] = []
+    views: list[dict[str, Any]] = []
+    chat_context_providers: list[dict[str, Any]] = []
+
+    if include_core_defaults:
+        for key, label in (
+            ("coding", "Coding Jobs"),
+            ("chat", "Direct Chat Replies"),
+            ("billing", "Billing Alerts"),
+            ("ops", "Test & Ops Pings"),
+        ):
+            seen_push.add(key)
+            push_categories.append({"key": key, "label": label, "default_enabled": True, "plugin_id": None})
+        for key, label in (
+            ("chat", "Chat"),
+            ("coding", "Coding"),
+            ("billing", "Billing"),
+        ):
+            seen_kinds.add(key)
+            thread_kinds.append({"key": key, "label": label, "show_in_inbox": True, "plugin_id": None})
+
+    if registry is not None:
+        for pid, loaded in registry.plugins.items():
+            m = loaded.manifest
+            granted = loaded.context.granted_permissions
+
+            for cat in m.push_categories:
+                if cat.id not in seen_push:
+                    seen_push.add(cat.id)
+                    push_categories.append(
+                        {
+                            "key": cat.id,
+                            "label": cat.label,
+                            "default_enabled": cat.default_enabled,
+                            "plugin_id": pid,
+                        }
+                    )
+
+            for tk in m.thread_kinds:
+                if tk.key not in seen_kinds:
+                    seen_kinds.add(tk.key)
+                    thread_kinds.append(
+                        {
+                            "key": tk.key,
+                            "label": tk.label,
+                            "show_in_inbox": tk.show_in_inbox,
+                            "plugin_id": pid,
+                        }
+                    )
+                if not tk.show_in_inbox and tk.key not in exclude_inbox_kinds:
+                    exclude_inbox_kinds.append(tk.key)
+
+            for cp in m.chat_context_providers:
+                chat_context_providers.append(
+                    {
+                        "id": cp.id,
+                        "label": cp.label,
+                        "default_enabled": cp.default_enabled,
+                        "plugin_id": pid,
+                    }
+                )
+
+            if "pwa_views" in granted:
+                for view in m.pwa_views:
+                    mount_clean = "/" + view.mount_path.strip("/") if view.mount_path.strip("/") else ""
+                    rel_script = view.script_path.removeprefix("static/") if view.script_path else ""
+                    script_url = (
+                        f"{clean_base}/api/plugins/{pid}/static/{rel_script}" if rel_script else ""
+                    )
+                    views.append(
+                        {
+                            "id": view.id,
+                            "plugin_id": pid,
+                            "title": view.title,
+                            "short_name": view.short_name,
+                            "mount_path": mount_clean,
+                            "href": f"{mount_clean}/" if mount_clean else "",
+                            "nav_tab": view.nav_tab or view.short_name,
+                            "icon": view.icon,
+                            "nav_placement": view.nav_placement,
+                            "script_url": script_url,
+                            "standalone_pwa": view.standalone_pwa,
+                            "push_category_keys": [c.id for c in m.push_categories],
+                        }
+                    )
+
+    return {
+        "views": views,
+        "push_categories": push_categories,
+        "thread_kinds": thread_kinds,
+        "exclude_inbox_kinds": exclude_inbox_kinds,
+        "chat_context_providers": chat_context_providers,
+    }
+
+
 def _render_plugin_pwa_shell(view: PwaViewSpec, plugin_id: str, base_path: str) -> str:
     script_url = (
         f"{base_path}/api/plugins/{plugin_id}/static/{view.script_path.removeprefix('static/')}"
@@ -240,6 +347,8 @@ def create_microkernel_app(
                     ],
                     "channel_roles": [r.model_dump() for r in m.channel_roles],
                     "push_categories": [p.model_dump() for p in m.push_categories],
+                    "thread_kinds": [t.model_dump() for t in m.thread_kinds],
+                    "chat_context_providers": [c.model_dump() for c in m.chat_context_providers],
                     "pwa_views": views,
                 }
             )
@@ -248,6 +357,10 @@ def create_microkernel_app(
             "pwa_views": pwa_views_out,
             "services": sorted(registry.services.keys()),
         }
+
+    @root_router.get("/api/ui/manifest")
+    async def get_ui_manifest() -> dict[str, Any]:
+        return build_ui_manifest(registry, base_path=clean_base)
 
     @root_router.post("/api/plugins/backup")
     async def backup_all_plugins(retain: int = 14) -> dict[str, Any]:

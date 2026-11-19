@@ -12,3 +12,7 @@ push_categories:
   - id: deps
     label: Dependency Upgrades
     default_enabled: true
+thread_kinds:
+  - key: deps
+    label: Deps
+    show_in_inbox: true

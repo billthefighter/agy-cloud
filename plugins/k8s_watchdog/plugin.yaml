@@ -12,3 +12,7 @@ push_categories:
   - id: k8s
     label: Kubernetes & Argo CD Alerts
     default_enabled: true
+thread_kinds:
+  - key: k8s
+    label: K8s
+    show_in_inbox: true

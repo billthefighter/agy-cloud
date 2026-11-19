@@ -43,15 +43,32 @@ class PushCategorySpec(BaseModel):
     default_enabled: bool = True
 
 
+class ThreadKindSpec(BaseModel):
+    """Declares a thread kind emitted by a plugin and whether it appears in the main chat inbox."""
+
+    key: str
+    label: str
+    show_in_inbox: bool = True
+
+
+class ChatContextProviderSpec(BaseModel):
+    """Declares an optional context chip in the '+ New Chat' modal backed by `build_chat_context()`."""
+
+    id: str
+    label: str
+    default_enabled: bool = False
+
+
 class PwaViewSpec(BaseModel):
     id: str
     title: str
     short_name: str
     mount_path: str
     nav_tab: str = ""
-    icon: str = "sparkles"
+    icon: str = "✨"
     script_path: str = ""
     standalone_pwa: bool = False
+    nav_placement: str = "topbar"  # "topbar" | "tab" | "none"
 
 
 class PluginManifest(BaseModel):
@@ -69,6 +86,8 @@ class PluginManifest(BaseModel):
     default_config: dict[str, Any] = Field(default_factory=dict)
     channel_roles: list[ChannelRoleSpec] = Field(default_factory=list)
     push_categories: list[PushCategorySpec] = Field(default_factory=list)
+    thread_kinds: list[ThreadKindSpec] = Field(default_factory=list)
+    chat_context_providers: list[ChatContextProviderSpec] = Field(default_factory=list)
     pwa_views: list[PwaViewSpec] = Field(default_factory=list)
     skills_dir: str = "skills"
 
@@ -526,3 +545,11 @@ class AgyCloudPlugin[ConfigT: BaseModel]:
     def get_api_router(self) -> APIRouter | None:
         """Return an optional FastAPI APIRouter mounted at `/api/plugins/<plugin_id>`."""
         return None
+
+    async def build_chat_context(
+        self,
+        ctx: PluginContext[ConfigT],
+        provider_id: str,
+    ) -> str:
+        """Return optional prompt context text when a user enables one of this plugin's chat context providers."""
+        return ""

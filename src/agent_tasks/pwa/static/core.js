@@ -1,4 +1,4 @@
-import { escapeHtml } from "./markdown.js";
+import { escapeHtml, relativeTime, renderDiff, renderMarkdown } from "./markdown.js";
 
 export const MODELS = [
   { id: "gemini-4-hydrogen", label: "Hydrogen" },
@@ -7,16 +7,11 @@ export const MODELS = [
   { id: "gemini-3.8-flash", label: "Flash" },
 ];
 
-export const PUSH_CATEGORIES = [
-  { key: "coding", label: "Coding Jobs" },
-  { key: "chat", label: "Direct Chat Replies" },
-  { key: "sentry", label: "Sentry Triage" },
-  { key: "ci", label: "CI Healer" },
-  { key: "k8s", label: "K8s / Argo CD Alerts" },
-  { key: "billing", label: "$100/mo Billing Alerts" },
-  { key: "deps", label: "Dependency Upgrades" },
-  { key: "food", label: "Food Digest & Logs" },
-  { key: "ops", label: "Test & Ops Pings" },
+export const CORE_PUSH_CATEGORIES = [
+  { key: "coding", label: "Coding Jobs", default_enabled: true, plugin_id: null },
+  { key: "chat", label: "Direct Chat Replies", default_enabled: true, plugin_id: null },
+  { key: "billing", label: "Billing Alerts", default_enabled: true, plugin_id: null },
+  { key: "ops", label: "Test & Ops Pings", default_enabled: true, plugin_id: null },
 ];
 
 function readMeta(name, fallback = "") {
@@ -25,7 +20,7 @@ function readMeta(name, fallback = "") {
 
 export const appMode = readMeta("agy-app-mode", "chat");
 export const chatBase = readMeta("agy-chat-base", "/agy").replace(/\/$/, "");
-export const healthBase = readMeta("agy-health-base", "/health").replace(/\/$/, "");
+export const viewScript = readMeta("agy-view-script", "").trim();
 
 export const state = {
   authenticated: false,
@@ -33,14 +28,14 @@ export const state = {
   slackEnabled: true,
   vapidPublicKey: "",
   wsStatus: "offline",
-  tab: appMode === "health" ? "food" : "inbox",
+  tab: "inbox",
   folder: "inbox",
   filter: "all",
   kind: "all",
   query: "",
   threads: [],
   counts: { unread_threads: 0, unread_total: 0, needs_review: 0, running: 0, inbox: 0, archived: 0 },
-  defaultRepo: "lodbrok-app/rattlsnek",
+  defaultRepo: "",
   defaultModel: "gemini-4-hydrogen",
   activeThreadId: null,
   activeThread: null,
@@ -52,29 +47,25 @@ export const state = {
   newModalOpen: false,
   newMode: "chat",
   newPrompt: "",
-  newRepo: "lodbrok-app/rattlsnek",
+  newRepo: "",
   newModel: "gemini-4-hydrogen",
   newFiles: [],
-  newIncludeHealth: false,
+  newContextProviders: {},
   patchModalDiff: null,
-  foodDate: "",
-  foodToday: null,
-  foodWeek: null,
-  foodTrends: null,
-  foodShowWeek: false,
-  foodShowTargets: false,
-  foodInput: "",
-  foodModel: "gemini-4-hydrogen",
-  foodFiles: [],
-  foodStatus: "",
-  foodPendingTs: "",
-  foodError: "",
-  foodNotice: "",
-  foodSuggestResult: "",
-  foodPhotoModal: null,
   opsOverview: null,
+  uiManifest: {
+    views: [],
+    push_categories: [...CORE_PUSH_CATEGORIES],
+    thread_kinds: [
+      { key: "chat", label: "Chat", show_in_inbox: true, plugin_id: null },
+      { key: "coding", label: "Coding", show_in_inbox: true, plugin_id: null },
+      { key: "billing", label: "Billing", show_in_inbox: true, plugin_id: null },
+    ],
+    exclude_inbox_kinds: [],
+    chat_context_providers: [],
+  },
   pushSub: null,
-  pushPrefs: Object.fromEntries(PUSH_CATEGORIES.map((c) => [c.key, true])),
+  pushPrefs: Object.fromEntries(CORE_PUSH_CATEGORIES.map((c) => [c.key, true])),
   swReg: null,
   submitting: false,
   booting: true,
@@ -215,7 +206,7 @@ export function isStandaloneMode() {
 }
 
 export function updateAppBadge() {
-  if (appMode === "health") return;
+  if (appMode !== "chat") return;
   if (navigator.setAppBadge) {
     const count = Number(state.counts?.unread_total || 0);
     if (count > 0) navigator.setAppBadge(count).catch(() => {});
@@ -319,6 +310,40 @@ export function updateWsDot() {
   }
 }
 
+export async function loadUiManifest() {
+  try {
+    const manifest = await apiFetch("api/ui/manifest");
+    if (manifest && typeof manifest === "object") {
+      state.uiManifest = {
+        views: Array.isArray(manifest.views) ? manifest.views : [],
+        push_categories:
+          Array.isArray(manifest.push_categories) && manifest.push_categories.length
+            ? manifest.push_categories
+            : [...CORE_PUSH_CATEGORIES],
+        thread_kinds: Array.isArray(manifest.thread_kinds) ? manifest.thread_kinds : [],
+        exclude_inbox_kinds: Array.isArray(manifest.exclude_inbox_kinds)
+          ? manifest.exclude_inbox_kinds
+          : [],
+        chat_context_providers: Array.isArray(manifest.chat_context_providers)
+          ? manifest.chat_context_providers
+          : [],
+      };
+      for (const cat of state.uiManifest.push_categories) {
+        if (!(cat.key in state.pushPrefs)) {
+          state.pushPrefs[cat.key] = cat.default_enabled !== false;
+        }
+      }
+      for (const cp of state.uiManifest.chat_context_providers) {
+        if (!(cp.id in state.newContextProviders)) {
+          state.newContextProviders[cp.id] = Boolean(cp.default_enabled);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("UI manifest load skipped:", err);
+  }
+}
+
 export async function handleLogin(tokenStr, { rethrow = false } = {}) {
   const clean = (tokenStr || "").trim();
   if (!clean) return toast("Enter your PWA access token.");
@@ -342,8 +367,9 @@ export async function handleLogin(tokenStr, { rethrow = false } = {}) {
     state.bootDiag = null;
     state.vapidPublicKey = data.vapid_public_key || state.vapidPublicKey;
     connectWebSocket();
+    await loadUiManifest();
     await modeAdapter.onAuthenticated(new URLSearchParams(location.hash.replace(/^#/, "")));
-    toast("Connected to makesense.");
+    toast("Connected to gateway.");
   } catch (err) {
     if (rethrow) throw err;
     toast(`Sign-in failed: ${err.message}`);
@@ -502,7 +528,7 @@ function renderBootDiagCard() {
     gatewayReached ? "Trusted" : isNetworkOrTlsAbort ? "Unverified (check iOS Trust)" : "Not reached",
     gatewayReached ? "ok" : isNetworkOrTlsAbort ? "warn" : "muted"
   );
-  const serviceLabel = appMode === "health" ? `AGY Health (${healthBase || "/health"})` : `AGY Service (${chatBase || "/agy"})`;
+  const serviceLabel = `${document.title || "AGY Service"} (${location.pathname})`;
   const serviceRow = renderDiagLayerRow(
     serviceLabel,
     d.healthz?.ok
@@ -558,7 +584,7 @@ function renderLoginScreen() {
       </p>`
     : "";
 
-  const appTitle = appMode === "health" ? "AGY Health" : "AGY Tasks";
+  const appTitle = document.title || "AGY Tasks";
   return `
     <div class="main-scroll" style="display:flex;flex-direction:column;justify-content:center;gap:14px;">
       ${renderBootDiagCard()}
@@ -584,13 +610,25 @@ export function renderSettingsView() {
   const pushSupported = "serviceWorker" in navigator && "PushManager" in window;
   const perm = typeof Notification !== "undefined" ? Notification.permission : "unsupported";
   const subActive = Boolean(state.pushSub);
-  const categories =
-    appMode === "health"
-      ? PUSH_CATEGORIES.filter((c) => c.key === "food" || c.key === "ops")
-      : PUSH_CATEGORIES;
 
-  const switchHref = appMode === "health" ? `${chatBase}/` : `${healthBase}/`;
-  const switchLabel = appMode === "health" ? "Open AGY Tasks (Chat & Ops) ↗" : "Open AGY Health (Food & Garmin) ↗";
+  const allCategories = state.uiManifest?.push_categories?.length
+    ? state.uiManifest.push_categories
+    : CORE_PUSH_CATEGORIES;
+  const views = state.uiManifest?.views || [];
+  const currentView = appMode !== "chat" ? views.find((v) => v.id === appMode) : null;
+
+  let categories = allCategories;
+  if (currentView && Array.isArray(currentView.push_category_keys) && currentView.push_category_keys.length) {
+    const allowed = new Set([...currentView.push_category_keys, "ops"]);
+    categories = allCategories.filter((c) => allowed.has(c.key));
+  }
+
+  const switchLinks =
+    appMode !== "chat"
+      ? [{ href: `${chatBase}/`, label: "Open AGY Tasks (Chat & Ops) ↗" }]
+      : views
+          .filter((v) => v.href)
+          .map((v) => ({ href: v.href, label: `Open ${v.title} ↗` }));
 
   return `
     <div class="top-bar">
@@ -617,7 +655,7 @@ export function renderSettingsView() {
             (cat) => `
           <label class="toggle-row">
             <span>${escapeHtml(cat.label)}</span>
-            <input type="checkbox" data-push-pref="${cat.key}" ${state.pushPrefs[cat.key] !== false ? "checked" : ""} />
+            <input type="checkbox" data-push-pref="${escapeHtml(cat.key)}" ${state.pushPrefs[cat.key] !== false ? "checked" : ""} />
           </label>`
           )
           .join("")}
@@ -625,7 +663,12 @@ export function renderSettingsView() {
       </div>
 
       <div class="card">
-        <a href="${escapeHtml(switchHref)}" class="full-btn secondary" style="display:block;text-align:center;text-decoration:none;margin-bottom:8px;">${escapeHtml(switchLabel)}</a>
+        ${switchLinks
+          .map(
+            (lnk) =>
+              `<a href="${escapeHtml(lnk.href)}" class="full-btn secondary" style="display:block;text-align:center;text-decoration:none;margin-bottom:8px;">${escapeHtml(lnk.label)}</a>`
+          )
+          .join("")}
         ${
           state.caAvailable
             ? `<a href="./ca.crt" class="full-btn secondary" style="display:block;text-align:center;text-decoration:none;margin-bottom:8px;">Download homelab-ca.crt</a>`
@@ -806,6 +849,7 @@ export async function boot() {
     }
     if (state.authenticated && !loggedInViaHelper) {
       connectWebSocket();
+      await loadUiManifest();
       await modeAdapter.onAuthenticated(hashParams);
     }
   } catch (err) {
@@ -850,3 +894,22 @@ export async function boot() {
     render();
   }
 }
+
+export const coreApi = {
+  appMode,
+  chatBase,
+  viewScript,
+  state,
+  apiFetch,
+  cycleModel,
+  modelShortLabel,
+  registerAppMode,
+  render,
+  sendWsViewState,
+  toast,
+  updateAppBadge,
+  escapeHtml,
+  renderMarkdown,
+  relativeTime,
+  renderDiff,
+};

@@ -12,3 +12,7 @@ push_categories:
   - id: sentry
     label: Sentry Issue Triage
     default_enabled: true
+thread_kinds:
+  - key: sentry
+    label: Sentry
+    show_in_inbox: true

@@ -57,6 +57,7 @@ from agent_tasks.pwa.auth import SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECONDS, P
 from agent_tasks.pwa.push import DEFAULT_PUSH_PREFS, WebPushManager
 from agent_tasks.tasks.billing_guard.pricing import compute_billing_cycle
 from agent_tasks.tasks.direct_chat import DirectChatService
+from agy_cloud.core.gateway import build_ui_manifest
 
 if TYPE_CHECKING:
     from agent_tasks.channels.slack_socket import SlackSocketAdapter
@@ -1179,6 +1180,7 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
         title: str,
         short_name: str,
         description: str,
+        view_script_url: str = "",
     ) -> None:
         shell_router = APIRouter(prefix=prefix)
         scope = f"{prefix}/"
@@ -1254,7 +1256,7 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
             meta_tags = (
                 f'    <meta name="agy-app-mode" content="{mode}" />\n'
                 f'    <meta name="agy-chat-base" content="{base_path}" />\n'
-                f'    <meta name="agy-health-base" content="{health_base_path}" />\n'
+                f'    <meta name="agy-view-script" content="{view_script_url}" />\n'
             )
             html = html.replace("<title>AGY Tasks</title>", f"<title>{title}</title>\n{meta_tags}")
             html = html.replace(
@@ -1439,6 +1441,7 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
         prompt: str = Form(default=""),
         model: str = Form(default=""),
         include_health_context: bool = Form(default=False),
+        context_providers: Annotated[list[str] | None, Form()] = None,
         files: Annotated[list[UploadFile] | None, File()] = None,
     ) -> dict[str, Any]:
         uploads: list[tuple[str, bytes]] = []
@@ -1449,12 +1452,49 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
         if not prompt.strip() and not uploads:
             raise HTTPException(status_code=400, detail="Provide a prompt or photo.")
 
-        effective_prompt = prompt
-        if include_health_context and gateway.food_task is not None:
+        requested_providers = [p.strip() for p in (context_providers or []) if p and p.strip()]
+        if include_health_context and "health" not in requested_providers:
+            requested_providers.append("health")
+
+        context_blocks: list[str] = []
+        handled_providers: set[str] = set()
+        if requested_providers and gateway.plugin_registry is not None:
+            for provider_id in requested_providers:
+                for loaded in gateway.plugin_registry.plugins.values():
+                    if any(cp.id == provider_id for cp in loaded.manifest.chat_context_providers):
+                        try:
+                            block = await loaded.plugin.build_chat_context(
+                                loaded.context, provider_id
+                            )
+                        except Exception as exc:
+                            log.warning(
+                                "pwa_chat_context_provider_failed",
+                                provider_id=provider_id,
+                                plugin_id=loaded.manifest.id,
+                                error=str(exc),
+                            )
+                            block = ""
+                        if block and block.strip():
+                            context_blocks.append(block.strip())
+                            handled_providers.add(provider_id)
+                        break
+
+        if (
+            "health" in requested_providers
+            and "health" not in handled_providers
+            and gateway.food_task is not None
+        ):
             cfg = gateway._load_targets().food_tracker
             today = gateway.food_task._today_local_date(cfg)
             health_ctx = gateway.food_task.nutrition.build_coach_context(today, cfg, days=7)
-            effective_prompt = f"{health_ctx}\n\nUser question:\n{prompt.strip()}"
+            if health_ctx and health_ctx.strip():
+                context_blocks.append(health_ctx.strip())
+
+        effective_prompt = (
+            f"{'\n\n'.join(context_blocks)}\n\nUser question:\n{prompt.strip()}"
+            if context_blocks
+            else prompt
+        )
 
         thread, user_msg, image_paths, cleaned_prompt, chosen_model = (
             gateway.direct_chat.create_chat_and_append_user_msg(
@@ -2467,21 +2507,55 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
                     "version": loaded.manifest.version,
                     "description": loaded.manifest.description,
                     "commands": [c.name for c in loaded.commands],
+                    "push_categories": [p.model_dump() for p in loaded.manifest.push_categories],
+                    "thread_kinds": [t.model_dump() for t in loaded.manifest.thread_kinds],
+                    "chat_context_providers": [
+                        c.model_dump() for c in loaded.manifest.chat_context_providers
+                    ],
+                    "pwa_views": [v.model_dump() for v in loaded.manifest.pwa_views],
                 }
                 for pid, loaded in reg.plugins.items()
             ],
             "services": sorted(reg.services.keys()),
         }
 
+    @router.get("/api/ui/manifest", dependencies=[Depends(_require_auth)])
+    async def get_ui_manifest() -> dict[str, Any]:
+        return build_ui_manifest(gateway.plugin_registry, base_path=base_path)
+
+    def _make_plugin_static_handler(plugin_static_root: Path):
+        resolved_root = plugin_static_root.resolve()
+
+        async def _serve_plugin_static(asset_path: str) -> Response:
+            if ".." in Path(asset_path).parts:
+                raise HTTPException(status_code=404, detail="Plugin static asset not found")
+            candidate = (resolved_root / asset_path).resolve()
+            if not candidate.is_relative_to(resolved_root) or not candidate.is_file():
+                raise HTTPException(status_code=404, detail="Plugin static asset not found")
+            return FileResponse(candidate, headers={"Cache-Control": "no-cache"})
+
+        return _serve_plugin_static
+
+    mounted_standalone_paths: set[str] = set()
     if gateway.plugin_registry is not None:
         for pid, loaded in gateway.plugin_registry.plugins.items():
-            p_router = loaded.plugin.get_api_router()
+            granted = loaded.context.granted_permissions
+            p_router = loaded.plugin.get_api_router() if "api_router" in granted else None
             if p_router is not None:
                 router.include_router(
                     p_router,
                     prefix=f"/api/plugins/{pid}",
                     dependencies=[Depends(_require_auth)],
                 )
+            if "pwa_views" in granted and loaded.source_dir is not None:
+                p_static = loaded.source_dir / "static"
+                if p_static.is_dir():
+                    router.add_api_route(
+                        f"/api/plugins/{pid}/static/{{asset_path:path}}",
+                        _make_plugin_static_handler(p_static),
+                        methods=["GET"],
+                        name=f"plugin_static_{pid}",
+                    )
 
     _mount_pwa_shell(
         base_path,
@@ -2492,7 +2566,40 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
     )
     app.include_router(router, prefix=base_path)
 
-    if health_base_path and health_base_path != base_path:
+    if gateway.plugin_registry is not None:
+        for pid, loaded in gateway.plugin_registry.plugins.items():
+            if "pwa_views" not in loaded.context.granted_permissions:
+                continue
+            for view in loaded.manifest.pwa_views:
+                view_prefix = "/" + view.mount_path.strip("/") if view.mount_path.strip("/") else ""
+                if (
+                    not view.standalone_pwa
+                    or not view_prefix
+                    or view_prefix == base_path
+                    or view_prefix in mounted_standalone_paths
+                ):
+                    continue
+                rel_script = view.script_path.removeprefix("static/") if view.script_path else ""
+                view_script_url = (
+                    f"./api/plugins/{pid}/static/{rel_script}" if rel_script else ""
+                )
+                _mount_pwa_shell(
+                    view_prefix,
+                    mode=view.id,
+                    title=view.title,
+                    short_name=view.short_name,
+                    description=loaded.manifest.description or view.title,
+                    view_script_url=view_script_url,
+                )
+                app.include_router(router, prefix=view_prefix)
+                mounted_standalone_paths.add(view_prefix)
+
+    if (
+        health_base_path
+        and health_base_path != base_path
+        and health_base_path not in mounted_standalone_paths
+        and gateway.food_task is not None
+    ):
         _mount_pwa_shell(
             health_base_path,
             mode="health",

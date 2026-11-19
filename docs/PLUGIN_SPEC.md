@@ -228,3 +228,50 @@ snapshot_path = db.backup_compressed(retain=14)
 ```
 *(Advanced plugins with custom store classes can still call `self.ctx.sqlite_path("nutrition.sqlite3")`, which registers the file with the Core's online backup service while returning the raw `Path`.)*
 
+---
+
+## 6. Lightweight Web UI & Manifest Contract (`GET /api/ui/manifest`)
+
+The built-in mobile PWA shell (`src/agent_tasks/pwa/static/`) is intentionally domain-agnostic and zero-build (vanilla ES modules). It adapts dynamically to whatever plugins are loaded by fetching `GET /api/ui/manifest` after authentication.
+
+Plugins opt into UI surfaces purely through `plugin.yaml`:
+
+```yaml
+push_categories:
+  - id: food
+    label: Nutrition & Check-ins
+    default_enabled: true
+
+thread_kinds:
+  - key: food
+    label: Food
+    show_in_inbox: false   # false => excluded from the main Chat Inbox automatically
+
+chat_context_providers:
+  - id: health
+    label: Include 7-day Garmin, Sleep, HRV & Nutrition context
+    default_enabled: false
+
+pwa_views:
+  - id: health
+    title: AGY Health
+    short_name: Health
+    mount_path: /health
+    icon: "🍽️"
+    nav_placement: topbar  # "topbar" | "tab" | "none"
+    script_path: static/health_view.js
+    standalone_pwa: true   # mounts its own /health/ shell & manifest.webmanifest
+```
+
+### Custom View ES Module Contract (`export function init(core)`)
+
+When a plugin declares `pwa_views` with `script_path: static/my_view.js` and holds the `pwa_views` permission:
+1. The gateway serves the plugin's `static/` directory at `/api/plugins/<plugin_id>/static/<asset>`.
+2. For `standalone_pwa: true`, the gateway mounts `<mount_path>/` with `<meta name="agy-view-script" content="./api/plugins/<plugin_id>/static/my_view.js" />`.
+3. `app.js` dynamically `import()`s the module and invokes `mod.init(core)`, passing `core` (`{ state, appMode, chatBase, apiFetch, registerAppMode, render, toast, cycleModel, modelShortLabel, escapeHtml, renderMarkdown }`) so plugin views need zero relative imports back to core JS files.
+
+### Chat Context Providers (`build_chat_context`)
+
+Plugins declaring `chat_context_providers` automatically get checkboxes in the `+ New Chat` modal (and `#new_chat=1&context=<provider_id>` deep links). When checked, the gateway calls `await plugin.build_chat_context(ctx, provider_id)` and prepends the returned string to the user's prompt.
+
+

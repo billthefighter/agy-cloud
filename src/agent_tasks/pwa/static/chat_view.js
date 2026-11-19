@@ -2,7 +2,6 @@ import { escapeHtml, relativeTime, renderDiff, renderMarkdown } from "./markdown
 import {
   apiFetch,
   cycleModel,
-  healthBase,
   modelShortLabel,
   registerAppMode,
   render,
@@ -14,11 +13,12 @@ import {
 
 async function loadThreads() {
   try {
+    const excludeKinds = (state.uiManifest?.exclude_inbox_kinds || []).join(",");
     const params = new URLSearchParams({
       folder: state.filter === "archived" ? "archived" : state.folder,
       filter: state.filter,
       kind: state.kind === "all" ? "" : state.kind,
-      exclude_kinds: "food",
+      exclude_kinds: excludeKinds,
       q: state.query,
     });
     const res = await apiFetch(`api/threads?${params.toString()}`);
@@ -113,7 +113,9 @@ async function submitNewTaskOrChat() {
       const fd = new FormData();
       fd.append("prompt", prompt);
       fd.append("model", state.newModel);
-      fd.append("include_health_context", state.newIncludeHealth ? "true" : "false");
+      for (const [providerId, enabled] of Object.entries(state.newContextProviders || {})) {
+        if (enabled) fd.append("context_providers", providerId);
+      }
       for (const f of state.newFiles) fd.append("files", f);
       const res = await apiFetch("api/chats", { method: "POST", body: fd });
       state.newModalOpen = false;
@@ -217,15 +219,22 @@ function renderInboxView() {
     { id: "chats", label: "Chats", count: null },
     { id: "archived", label: "Archived", count: null },
   ];
+  const manifestKinds = (state.uiManifest?.thread_kinds || [])
+    .filter((k) => k.show_in_inbox !== false)
+    .map((k) => [k.key, k.label]);
   const kinds = [
     ["all", "All"],
-    ["chat", "Chat"],
-    ["coding", "Coding"],
-    ["sentry", "Sentry"],
-    ["ci", "CI"],
-    ["k8s", "K8s"],
-    ["billing", "Billing"],
+    ...(manifestKinds.length
+      ? manifestKinds
+      : [
+          ["chat", "Chat"],
+          ["coding", "Coding"],
+          ["billing", "Billing"],
+        ]),
   ];
+  const topbarPluginLinks = (state.uiManifest?.views || []).filter(
+    (v) => v.nav_placement === "topbar" && v.href
+  );
 
   const listHtml = state.threads.length
     ? state.threads
@@ -266,7 +275,12 @@ function renderInboxView() {
         <span class="truncate">Inbox</span>
       </div>
       <div class="top-actions">
-        ${healthBase ? `<a href="${escapeHtml(healthBase)}/" class="icon-btn" title="Open AGY Health" style="text-decoration:none;">🍽️</a>` : ""}
+        ${topbarPluginLinks
+          .map(
+            (v) =>
+              `<a href="${escapeHtml(v.href)}" class="icon-btn" title="Open ${escapeHtml(v.title)}" style="text-decoration:none;">${escapeHtml(v.icon || "✨")}</a>`
+          )
+          .join("")}
         <button id="btn-refresh" class="icon-btn" title="Refresh">↻</button>
         <button id="btn-new-modal" class="icon-btn primary">+ New</button>
       </div>
@@ -525,10 +539,14 @@ function renderNewModal() {
         </div>
         ${
           state.newMode === "chat"
-            ? `<label class="coach-toggle">
-                <input id="chk-include-health" type="checkbox"${state.newIncludeHealth ? " checked" : ""} />
-                <span>Include 7-day Garmin, Sleep, HRV & Nutrition context</span>
+            ? (state.uiManifest?.chat_context_providers || [])
+                .map(
+                  (cp) => `<label class="coach-toggle">
+                <input type="checkbox" data-context-provider="${escapeHtml(cp.id)}"${state.newContextProviders?.[cp.id] ? " checked" : ""} />
+                <span>${escapeHtml(cp.label)}</span>
               </label>`
+                )
+                .join("")
             : ""
         }
         <button id="btn-submit-new" class="full-btn"${state.submitting ? " disabled" : ""}>${
@@ -650,8 +668,10 @@ function wireChatEvents() {
     state.newModel = cycleModel(state.newModel);
     render();
   });
-  document.getElementById("chk-include-health")?.addEventListener("change", (e) => {
-    state.newIncludeHealth = Boolean(e.target.checked);
+  document.querySelectorAll("[data-context-provider]").forEach((chk) => {
+    chk.addEventListener("change", (e) => {
+      state.newContextProviders[chk.dataset.contextProvider] = Boolean(e.target.checked);
+    });
   });
   document.getElementById("btn-submit-new")?.addEventListener("click", submitNewTaskOrChat);
 
@@ -761,13 +781,18 @@ export function initChatMode() {
     onAuthenticated: async (hashParams) => {
       await loadThreads();
       const hashThread = hashParams?.get("thread");
-      const newHealthChat = hashParams?.get("new_health_chat");
+      const newChat = hashParams?.get("new_chat");
+      const contextParam = hashParams?.get("context");
+      const legacyHealthChat = hashParams?.get("new_health_chat");
       if (hashThread) {
         await openThread(hashThread);
-      } else if (newHealthChat) {
+      } else if (newChat || contextParam || legacyHealthChat) {
         state.newModalOpen = true;
         state.newMode = "chat";
-        state.newIncludeHealth = true;
+        const providerId = contextParam || (legacyHealthChat ? "health" : "");
+        if (providerId) {
+          state.newContextProviders[providerId] = true;
+        }
         render();
       }
     },

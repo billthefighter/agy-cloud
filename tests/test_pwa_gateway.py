@@ -640,8 +640,9 @@ async def test_dual_pwa_endpoints_share_auth_and_split_manifests(tmp_path: Path)
         assert health_manifest["short_name"] == "Health"
 
         assert client.get("/health/sw.js").headers["service-worker-allowed"] == "/health/"
-        assert client.get("/health/static/health_view.js").status_code == 200
         assert client.get("/agy/static/chat_view.js").status_code == 200
+        assert client.get("/agy/static/app.js").status_code == 200
+        assert client.get("/agy/static/health_view.js").status_code == 404
         assert (
             client.get("/health/icons/icon-180.png").content
             != client.get("/agy/icons/icon-180.png").content
@@ -751,11 +752,6 @@ def test_health_meal_reaction_endpoint_and_ui_assets(tmp_path: Path) -> None:
             json={"emoji": "💪"},
         )
         assert missing.status_code == 404
-
-        health_js = client.get("/health/static/health_view.js").text
-        assert "renderMacroPieChart" in health_js
-        assert "photo-lightbox-backdrop" in health_js
-        assert "data-react-meal" in health_js
 
 
 def test_handoff_lifecycle_create_poll_and_pull(tmp_path: Path) -> None:
@@ -893,3 +889,137 @@ def test_handoff_lifecycle_create_poll_and_pull(tmp_path: Path) -> None:
         )
         assert fb_resp.status_code == 200
         assert any(a[0] == "feedback" and "[hydrogen] Also add docstring" in a[2] for a in actions)
+
+
+async def test_dynamic_plugin_ui_manifest_static_view_and_context_provider(tmp_path: Path) -> None:
+    from agy_cloud.core.gateway import MemoryChannelBus, RecordingWorkerJobService
+    from agy_cloud.core.loader import PluginRegistry
+
+    plugins_root = tmp_path / "demo_plugins"
+    plugin_dir = plugins_root / "demo_ui"
+    (plugin_dir / "static").mkdir(parents=True)
+    (plugin_dir / "static" / "widget.js").write_text(
+        "export function init(core) { core.registerAppMode({ initialTab: 'widget' }); }\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "plugin.yaml").write_text(
+        "\n".join(
+            [
+                "api_version: agy.cloud/v1",
+                "id: demo_ui",
+                "name: Demo UI Plugin",
+                "description: Standalone widget view and context provider.",
+                "entrypoint: server:DemoUiPlugin",
+                "push_categories:",
+                "  - id: demo_alerts",
+                "    label: Demo Alerts",
+                "    default_enabled: true",
+                "thread_kinds:",
+                "  - key: demo_private",
+                "    label: Demo",
+                "    show_in_inbox: false",
+                "chat_context_providers:",
+                "  - id: demo_ctx",
+                "    label: Include Demo telemetry",
+                "    default_enabled: false",
+                "pwa_views:",
+                "  - id: widget",
+                "    title: Demo Widget",
+                "    short_name: Widget",
+                "    mount_path: /widget",
+                '    icon: "🧪"',
+                "    nav_placement: topbar",
+                "    script_path: static/widget.js",
+                "    standalone_pwa: true",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (plugin_dir / "server.py").write_text(
+        "\n".join(
+            [
+                "from agy_cloud.sdk import AgyCloudPlugin",
+                "",
+                "class DemoUiPlugin(AgyCloudPlugin):",
+                "    async def build_chat_context(self, ctx, provider_id: str) -> str:",
+                '        if provider_id == "demo_ctx":',
+                '            return "DEMO_CONTEXT_BLOCK: battery=99%"',
+                '        return ""',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    # 1) Without plugins: zero plugin bleed in /api/ui/manifest
+    no_plugins_dir = tmp_path / "no_plugins"
+    no_plugins_dir.mkdir()
+    _, _, _, _, _, base_app, _ = _make_stack(no_plugins_dir)
+    headers = {"Authorization": "Bearer super-secret-pwa-token"}
+    with TestClient(base_app) as client:
+        empty_manifest = client.get("/agy/api/ui/manifest", headers=headers).json()
+        assert empty_manifest["views"] == []
+        assert empty_manifest["exclude_inbox_kinds"] == []
+        assert empty_manifest["chat_context_providers"] == []
+
+    # 2) With DemoUiPlugin loaded: dynamic manifest, standalone view, static JS, context provider
+    registry = PluginRegistry(
+        state_root=tmp_path / "plugin_state",
+        channels=MemoryChannelBus(),
+        jobs=RecordingWorkerJobService(),
+    )
+    await registry.load_all(
+        plugins_dir=plugins_root,
+        include_entrypoints=False,
+        install_python_deps=False,
+    )
+
+    with_plugins_dir = tmp_path / "with_plugins"
+    with_plugins_dir.mkdir()
+    _, _, _, gateway, _, _, _ = _make_stack(with_plugins_dir)
+    gateway.plugin_registry = registry
+    gateway._run_direct_chat_turn_bg = AsyncMock()
+    plugin_app = create_pwa_app(gateway)
+
+    with TestClient(plugin_app) as client:
+        ui = client.get("/agy/api/ui/manifest", headers=headers).json()
+        assert len(ui["views"]) == 1
+        assert ui["views"][0]["id"] == "widget"
+        assert ui["views"][0]["icon"] == "🧪"
+        assert ui["views"][0]["nav_placement"] == "topbar"
+        assert ui["views"][0]["href"] == "/widget/"
+        assert ui["exclude_inbox_kinds"] == ["demo_private"]
+        assert any(c["key"] == "demo_alerts" for c in ui["push_categories"])
+        assert ui["chat_context_providers"] == [
+            {
+                "id": "demo_ctx",
+                "label": "Include Demo telemetry",
+                "default_enabled": False,
+                "plugin_id": "demo_ui",
+            }
+        ]
+
+        # Standalone PWA shell dynamically injects agy-view-script meta tag
+        widget_html = client.get("/widget/").text
+        assert '<meta name="agy-app-mode" content="widget" />' in widget_html
+        assert (
+            '<meta name="agy-view-script" content="./api/plugins/demo_ui/static/widget.js" />'
+            in widget_html
+        )
+        assert "agy-health-base" not in widget_html
+
+        # Plugin static asset served cleanly; path traversal blocked
+        js_resp = client.get("/widget/api/plugins/demo_ui/static/widget.js")
+        assert js_resp.status_code == 200
+        assert "export function init(core)" in js_resp.text
+        assert client.get("/widget/api/plugins/demo_ui/static/../secret.txt").status_code == 404
+
+        # Chat context provider prepends plugin context block to prompt
+        chat_resp = client.post(
+            "/agy/api/chats",
+            headers=headers,
+            data={"prompt": "How is battery?", "context_providers": ["demo_ctx"]},
+        )
+        assert chat_resp.status_code == 200
+        assert "DEMO_CONTEXT_BLOCK: battery=99%" in chat_resp.json()["message"]["body_md"]

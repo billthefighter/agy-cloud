@@ -1,11 +1,10 @@
-const CACHE_NAME = "agy-pwa-shell-v9";
+const CACHE_NAME = "agy-pwa-shell-v10";
 const SHELL_ASSETS = [
   "./",
   "./static/styles.css",
   "./static/app.js",
   "./static/core.js",
   "./static/chat_view.js",
-  "./static/health_view.js",
   "./static/markdown.js",
   "./manifest.webmanifest",
   "./icons/icon-180.png",

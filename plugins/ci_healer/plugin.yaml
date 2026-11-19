@@ -12,3 +12,7 @@ push_categories:
   - id: ci
     label: CI Failures & Auto-Heals
     default_enabled: true
+thread_kinds:
+  - key: ci
+    label: CI
+    show_in_inbox: true
