@@ -131,6 +131,52 @@ def _extract_usage(agent: Any) -> TokenUsageSummary:
     )
 
 
+def _format_reasoning_trace(chunks: list[Any]) -> str:
+    """Format model Thought, ToolCall, and ToolResult chunks into a readable markdown trace."""
+    sections: list[str] = []
+    thought_buf: list[str] = []
+
+    def _flush_thoughts() -> None:
+        if thought_buf:
+            text = "".join(thought_buf).strip()
+            thought_buf.clear()
+            if text:
+                sections.append(text)
+
+    for chunk in chunks:
+        cls_name = type(chunk).__name__
+        if cls_name == "Thought":
+            txt = getattr(chunk, "text", "")
+            if txt:
+                thought_buf.append(str(txt))
+            continue
+
+        _flush_thoughts()
+
+        if cls_name == "ToolCall":
+            name = str(getattr(chunk, "name", "tool"))
+            args = getattr(chunk, "args", None) or {}
+            args_str = json.dumps(args, ensure_ascii=False) if args else ""
+            if len(args_str) > 500:
+                args_str = args_str[:500] + "…"
+            sections.append(f"**Tool Call:** `{name}`" + (f"\n```json\n{args_str}\n```" if args_str else ""))
+        elif cls_name == "ToolResult":
+            name = str(getattr(chunk, "name", "tool"))
+            err = getattr(chunk, "error", None)
+            if err:
+                sections.append(f"**Tool Error (`{name}`):** {err}")
+            else:
+                res = getattr(chunk, "result", None)
+                if res is not None:
+                    res_str = res if isinstance(res, str) else json.dumps(res, ensure_ascii=False)
+                    if len(res_str) > 1200:
+                        res_str = res_str[:1200] + "…"
+                    sections.append(f"**Tool Result (`{name}`):**\n```\n{res_str}\n```")
+
+    _flush_thoughts()
+    return "\n\n".join(sections).strip()
+
+
 class AgyNutritionEstimator:
     """In-controller multimodal Gemini estimator using the Google Antigravity SDK."""
 
@@ -223,6 +269,12 @@ class AgyNutritionEstimator:
                 if not raw:
                     raise RuntimeError(f"{model} returned empty structured nutrition output.")
                 result: Any = response_schema.model_validate(raw)
+                try:
+                    chunks = await response.resolve()
+                    trace = _format_reasoning_trace(chunks)
+                    result._reasoning_trace = trace or None
+                except Exception:
+                    log.debug("food_tracker.reasoning_trace_extract_failed", exc_info=True)
             else:
                 result = (await response.text() or "").strip()
             usage = _extract_usage(agent)

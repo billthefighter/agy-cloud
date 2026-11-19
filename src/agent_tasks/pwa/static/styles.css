@@ -950,6 +950,171 @@ button {
   cursor: pointer;
 }
 
+.meal-card[data-meal-id] {
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+}
+
+.meal-card[data-meal-id]:hover {
+  border-color: var(--border-strong);
+}
+
+.meal-trace-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(3, 7, 18, 0.85);
+  backdrop-filter: blur(6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: calc(var(--safe-top) + 16px) 16px calc(var(--safe-bottom) + 16px);
+  z-index: 60;
+}
+
+.meal-trace-card {
+  width: min(94vw, 680px);
+  max-height: 88dvh;
+  background: var(--bg-card);
+  border: 1px solid var(--border-strong);
+  border-radius: 16px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
+}
+
+.meal-trace-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elev);
+}
+
+.meal-trace-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.meal-trace-meta {
+  font-size: 12px;
+  color: var(--accent);
+  font-weight: 600;
+  margin-top: 3px;
+}
+
+.meal-trace-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.meal-trace-badge {
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.14);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+
+.meal-trace-close {
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  border-radius: 999px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-strong);
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.meal-trace-body {
+  padding: 14px 16px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.meal-trace-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.meal-trace-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+.meal-trace-note {
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text);
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+.meal-trace-items {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.meal-trace-item {
+  font-size: 12px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.meal-trace-dim {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.meal-trace-markdown {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  overflow-x: auto;
+}
+
+.meal-trace-markdown pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+}
+
+.meal-trace-empty {
+  font-size: 13px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
 .scale-row {
   display: flex;
   gap: 5px;

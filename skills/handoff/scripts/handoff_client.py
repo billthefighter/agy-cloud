@@ -630,6 +630,19 @@ def _format_summary(data: dict[str, Any]) -> str:
             lines.append(f"- **Affected Files:** {files_str}")
         if "tests_passed" in report:
             lines.append(f"- **Tests Passed:** `{report['tests_passed']}`")
+    progress_steps = data.get("progress_steps") or []
+    if isinstance(progress_steps, list) and progress_steps:
+        lines.append(f"- **Completed Steps:** `{len(progress_steps)}`")
+        for step in progress_steps[-5:]:
+            if not isinstance(step, dict):
+                continue
+            stype = step.get("step_type") or "step"
+            sidx = step.get("step_index")
+            text = str(step.get("text") or "").strip().replace("\n", " ")
+            if len(text) > 180:
+                text = text[:177] + "..."
+            label = f"#{sidx} `{stype}`" if sidx is not None else f"`{stype}`"
+            lines.append(f"  - {label}: {text}" if text else f"  - {label}")
     if data.get("last_error"):
         lines.append(f"- **Error:** `{data['last_error']}`")
     return "\n".join(lines)

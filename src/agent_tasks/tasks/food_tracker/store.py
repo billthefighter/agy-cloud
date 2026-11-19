@@ -207,6 +207,7 @@ class NutritionStore:
                     total_fat_g REAL NOT NULL,
                     total_fiber_g REAL NOT NULL DEFAULT 0,
                     reaction_emoji TEXT,
+                    reasoning_trace TEXT,
                     updated_at TEXT NOT NULL
                 );
                 """
@@ -216,6 +217,8 @@ class NutritionStore:
             }
             if "reaction_emoji" not in meal_cols:
                 conn.execute("ALTER TABLE meal_entries ADD COLUMN reaction_emoji TEXT")
+            if "reasoning_trace" not in meal_cols:
+                conn.execute("ALTER TABLE meal_entries ADD COLUMN reasoning_trace TEXT")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_meal_entries_local_date
@@ -366,6 +369,7 @@ class NutritionStore:
             total_fiber_g=float(row["total_fiber_g"]),
             updated_at=str(row["updated_at"]),
             reaction_emoji=row["reaction_emoji"],
+            reasoning_trace=row["reasoning_trace"] if "reasoning_trace" in row.keys() else None,
             items=items,
         )
 
@@ -554,6 +558,7 @@ class NutritionStore:
         scale_factor: float = 1.0,
         saved_food_ids: dict[int, int] | None = None,
         logged_at: str | None = None,
+        reasoning_trace: str | None = None,
     ) -> MealEntryRecord:
         now = logged_at or self._now()
         effective_date = resolve_valid_local_date(estimate.local_date_override, local_date)
@@ -575,8 +580,8 @@ class NutritionStore:
                     photo_relpath, slack_channel_id, slack_thread_ts, slack_card_ts,
                     model_used, confidence, assumptions_note, clarification_question,
                     scale_factor, total_calories_kcal, total_protein_g, total_carbs_g,
-                    total_fat_g, total_fiber_g, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    total_fat_g, total_fiber_g, reasoning_trace, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     now,
@@ -599,6 +604,7 @@ class NutritionStore:
                     total_c,
                     total_f,
                     total_fiber,
+                    (reasoning_trace or getattr(estimate, "_reasoning_trace", None) or "").strip() or None,
                     now,
                 ),
             )
@@ -723,6 +729,7 @@ class NutritionStore:
         model_used: str,
         *,
         photo_relpath: str | None = None,
+        reasoning_trace: str | None = None,
     ) -> MealEntryRecord:
         now = self._now()
         normalized_items = [normalize_item_macros(item)[0] for item in estimate.items]
@@ -781,6 +788,7 @@ class NutritionStore:
                     total_carbs_g = ?,
                     total_fat_g = ?,
                     total_fiber_g = ?,
+                    reasoning_trace = COALESCE(?, reasoning_trace),
                     updated_at = ?
                 WHERE id = ?
                 """,
@@ -799,6 +807,7 @@ class NutritionStore:
                     total_c,
                     total_f,
                     total_fiber,
+                    (reasoning_trace or getattr(estimate, "_reasoning_trace", None) or "").strip() or None,
                     now,
                     entry_id,
                 ),

@@ -66,6 +66,7 @@ class MealEstimateSchema(pydantic.BaseModel):
             "the meal by >150 kcal; otherwise empty string."
         ),
     )
+    _reasoning_trace: str | None = pydantic.PrivateAttr(default=None)
 
 
 @dataclass(slots=True)
@@ -136,6 +137,7 @@ class MealEntryRecord:
     total_fiber_g: float
     updated_at: str
     reaction_emoji: str | None = None
+    reasoning_trace: str | None = None
     items: list[MealItemRecord] = field(default_factory=list)
 
 

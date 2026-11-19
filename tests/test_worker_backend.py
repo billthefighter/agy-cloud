@@ -246,6 +246,99 @@ print(json.dumps({
     assert "+after" in patch_text
 
 
+@pytest.mark.asyncio
+async def test_run_worker_with_agy_cli_stream_json_records_completed_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    work_dir = tmp_path / "work"
+    session_dir = tmp_path / "session"
+    artifacts_dir = tmp_path / "artifacts"
+    memory_dir = tmp_path / "memory"
+    work_dir.mkdir()
+    artifacts_dir.mkdir()
+    memory_dir.mkdir()
+
+    subprocess.run(["git", "init"], cwd=work_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=work_dir, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=work_dir, check=True)
+    (work_dir / "hello.txt").write_text("before\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=work_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=work_dir, check=True, capture_output=True)
+    (artifacts_dir / "task_prompt.md").write_text("Update hello.txt", encoding="utf-8")
+
+    fake_agy = tmp_path / "fake-agy-stream"
+    fake_agy.write_text(
+        """#!/usr/bin/env python3
+import json, sys
+from pathlib import Path
+
+assert "--output-format" in sys.argv
+assert sys.argv[sys.argv.index("--output-format") + 1] == "stream-json"
+
+Path("hello.txt").write_text("after\\n", encoding="utf-8")
+events = [
+    {"event": "init", "conversation_id": "conv-stream-1", "init": {"model": "gemini-4-hydrogen-medium"}},
+    {"event": "step_update", "step_update": {"step_index": 0, "state": "DONE", "step_type": "user_input"}},
+    {"event": "step_update", "step_update": {"step_index": 1, "state": "ACTIVE", "step_type": "agent_response", "text_delta": "Inspecting "}},
+    {"event": "step_update", "step_update": {"step_index": 1, "state": "DONE", "step_type": "agent_response", "text_delta": "repo.", "duration_seconds": 1.2}},
+    {"event": "step_update", "step_update": {"step_index": 2, "state": "ACTIVE", "step_type": "agent_response", "text_delta": "Still working"}},
+    {"event": "result", "result": {
+        "conversation_id": "conv-stream-1",
+        "status": "SUCCESS",
+        "structured_output": {
+            "root_cause": "Streamed fix",
+            "confidence": "high",
+            "affected_files": ["hello.txt"],
+            "fix_summary": "Updated hello.txt",
+            "verification_commands": ["pytest"],
+            "tests_passed": True,
+            "risk_notes": "",
+            "should_notify": True,
+        },
+        "usage": {"input_tokens": 100, "output_tokens": 20, "thinking_tokens": 5, "cache_read_tokens": 0, "total_tokens": 120},
+    }},
+]
+for ev in events:
+    print(json.dumps(ev), flush=True)
+""",
+        encoding="utf-8",
+    )
+    fake_agy.chmod(fake_agy.stat().st_mode | stat.S_IEXEC)
+
+    monkeypatch.setenv("ISSUE_ID", "handoff-stream-1")
+    monkeypatch.setenv("SHORT_ID", "HANDOFF-S1")
+    monkeypatch.setenv("PROJECT_SLUG", "demo")
+    monkeypatch.setenv("TURN", "1")
+    monkeypatch.setenv("WORK_DIR", str(work_dir))
+    monkeypatch.setenv("SESSION_DIR", str(session_dir))
+    monkeypatch.setenv("ARTIFACTS_DIR", str(artifacts_dir))
+    monkeypatch.setenv("MEMORY_DIR", str(memory_dir))
+    monkeypatch.setenv("WORKER_BACKEND", "agy_cli")
+    monkeypatch.setenv("WORKER_MODEL", "gemini-4-hydrogen")
+    monkeypatch.setenv("AGY_CLI_BIN", str(fake_agy))
+
+    await run_worker()
+
+    progress_lines = [
+        json.loads(line)
+        for line in (artifacts_dir / "progress.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(progress_lines) == 1
+    assert progress_lines[0]["step_index"] == 1
+    assert progress_lines[0]["step_type"] == "agent_response"
+    assert progress_lines[0]["text"] == "Inspecting repo."
+    assert progress_lines[0]["duration_seconds"] == 1.2
+
+    envelope = WorkerEnvelope.model_validate_json(
+        (artifacts_dir / "result.json").read_text(encoding="utf-8")
+    )
+    assert envelope.conversation_id == "conv-stream-1"
+    assert envelope.has_patch is True
+
+
 def test_sync_agy_config_repo_creates_relative_symlinks(tmp_path: Path) -> None:
     import os
 

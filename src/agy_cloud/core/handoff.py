@@ -449,6 +449,20 @@ class HandoffService:
             data["patch"] = patch_file.read_text(encoding="utf-8")
         else:
             data["patch"] = ""
+        progress_file = art_dir / "progress.jsonl"
+        progress_steps: list[dict[str, Any]] = []
+        if progress_file.is_file():
+            for raw_line in progress_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict):
+                    progress_steps.append(item)
+        data["progress_steps"] = progress_steps[-20:]
         data["is_terminal"] = rec.status in TERMINAL_HANDOFF_STATUSES
         return data
 

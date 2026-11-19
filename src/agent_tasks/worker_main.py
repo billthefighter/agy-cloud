@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -170,6 +171,30 @@ def _parse_agy_cli_json(stdout_text: str) -> dict[str, Any]:
     raise RuntimeError(f"Could not parse JSON response from `agy` CLI: {cleaned[:400]}")
 
 
+def _append_progress_step(progress_path: Path | None, entry: dict[str, Any]) -> None:
+    """Append a completed worker step JSON line to `progress.jsonl`."""
+    if progress_path is None:
+        return
+    try:
+        progress_path.parent.mkdir(parents=True, exist_ok=True)
+        with progress_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+    except OSError as exc:
+        log.warning("worker.progress_write_failed", path=str(progress_path), error=str(exc))
+
+
+def _format_step_text(step_update: dict[str, Any], buffered_text: str) -> str:
+    """Extract a concise human-readable message from a completed `step_update`."""
+    text = buffered_text.strip()
+    if text:
+        return text
+    for key in ("tool_name", "name", "command", "summary", "message"):
+        val = step_update.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
 async def _run_agy_cli_worker(
     *,
     prompt: str,
@@ -179,6 +204,8 @@ async def _run_agy_cli_worker(
     turn: int,
     existing_conv_id: str | None,
     timeout_seconds: int,
+    issue_id: str = "",
+    artifacts_dir: Path | None = None,
 ) -> tuple[TriageReport | None, str, str, TokenUsageSummary, str]:
     """Execute a worker turn via the authenticated `agy` CLI (Google account subscription)."""
     cli_bin = os.environ.get("AGY_CLI_BIN", "agy").strip() or "agy"
@@ -197,13 +224,15 @@ async def _run_agy_cli_worker(
         schema_file.write(schema_json)
         schema_path = Path(schema_file.name)
 
+    progress_path = (artifacts_dir / "progress.jsonl") if artifacts_dir is not None else None
+
     try:
         cmd = [
             cli_bin,
             "-p",
             full_prompt,
             "--output-format",
-            "json",
+            "stream-json",
             "--json-schema",
             str(schema_path),
             "--model",
@@ -224,23 +253,104 @@ async def _run_agy_cli_worker(
             env=cli_env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=16 * 1024 * 1024,
         )
+
+        step_buffers: dict[int, list[str]] = {}
+        raw_stdout_lines: list[str] = []
+        result_payload: dict[str, Any] | None = None
+        streamed_conv_id = ""
+
+        async def _consume_stream() -> bytes:
+            nonlocal result_payload, streamed_conv_id
+            assert proc.stdout is not None
+            assert proc.stderr is not None
+            stderr_task = asyncio.create_task(proc.stderr.read())
+            try:
+                while True:
+                    raw_line = await proc.stdout.readline()
+                    if not raw_line:
+                        break
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    raw_stdout_lines.append(line)
+                    if not line.startswith("{"):
+                        continue
+                    try:
+                        event_obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(event_obj, dict):
+                        continue
+
+                    ev_type = event_obj.get("event")
+                    if ev_type == "init":
+                        cid = event_obj.get("conversation_id")
+                        if isinstance(cid, str) and cid:
+                            streamed_conv_id = cid
+                    elif ev_type == "step_update":
+                        su = event_obj.get("step_update")
+                        if not isinstance(su, dict):
+                            continue
+                        step_idx = su.get("step_index")
+                        step_type = str(su.get("step_type") or "")
+                        state = str(su.get("state") or "")
+                        delta = su.get("text_delta")
+                        if isinstance(step_idx, int) and isinstance(delta, str) and delta:
+                            step_buffers.setdefault(step_idx, []).append(delta)
+                        if state == "DONE" and step_type != "user_input":
+                            buf = "".join(
+                                step_buffers.pop(step_idx, [])
+                                if isinstance(step_idx, int)
+                                else []
+                            )
+                            msg_text = _format_step_text(su, buf)
+                            duration_s = su.get("duration_seconds")
+                            log.info(
+                                "worker.step_completed",
+                                issue_id=issue_id,
+                                turn=turn,
+                                step_index=step_idx,
+                                step_type=step_type,
+                                duration_seconds=duration_s,
+                                message=msg_text[:1000],
+                            )
+                            _append_progress_step(
+                                progress_path,
+                                {
+                                    "ts": datetime.now(UTC).isoformat(),
+                                    "turn": turn,
+                                    "step_index": step_idx,
+                                    "step_type": step_type,
+                                    "duration_seconds": duration_s,
+                                    "text": msg_text[:2000],
+                                },
+                            )
+                    elif ev_type == "result":
+                        res = event_obj.get("result")
+                        if isinstance(res, dict):
+                            result_payload = res
+                await proc.wait()
+                return await stderr_task
+            except Exception:
+                stderr_task.cancel()
+                raise
+
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout_seconds
-            )
+            stderr_b = await asyncio.wait_for(_consume_stream(), timeout=timeout_seconds)
         except TimeoutError:
             proc.kill()
             await proc.communicate()
             raise
 
-        stdout_text = stdout_b.decode("utf-8", errors="replace")
+        stdout_text = "\n".join(raw_stdout_lines)
         stderr_text = stderr_b.decode("utf-8", errors="replace")
         if proc.returncode != 0:
             err_excerpt = (stderr_text.strip() or stdout_text.strip())[:800]
             raise RuntimeError(f"agy CLI exited with code {proc.returncode}: {err_excerpt}")
 
-        payload = _parse_agy_cli_json(stdout_text)
+        payload = result_payload if result_payload is not None else _parse_agy_cli_json(stdout_text)
         raw_structured = payload.get("structured_output")
         if raw_structured is None and isinstance(payload.get("response"), str):
             try:
@@ -249,7 +359,7 @@ async def _run_agy_cli_worker(
                 raw_structured = None
 
         report = TriageReport.model_validate(raw_structured) if raw_structured else None
-        conv_id = str(payload.get("conversation_id") or existing_conv_id or "")
+        conv_id = str(payload.get("conversation_id") or streamed_conv_id or existing_conv_id or "")
         stop_reason = str(payload.get("status") or "SUCCESS")
         raw_usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
         usage_summary = TokenUsageSummary(
@@ -394,6 +504,8 @@ async def run_worker() -> None:
                     turn=turn,
                     existing_conv_id=existing_conv_id,
                     timeout_seconds=timeout_seconds,
+                    issue_id=issue_id,
+                    artifacts_dir=artifacts_dir,
                 )
             )
         else:
