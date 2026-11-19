@@ -1,0 +1,19 @@
+api_version: agy.cloud/v1
+id: handoff_view
+name: Handoff Sessions Dashboard
+version: 0.1.0
+description: Visual dashboard for laptop-to-k3s /handoff coding sessions, diffs, verification reports, and mobile feedback.
+author: agy-cloud
+entrypoint: server:HandoffViewPlugin
+permissions:
+  - pwa_views
+pwa_views:
+  - id: handoffs
+    title: AGY Handoffs
+    short_name: Handoffs
+    mount_path: /agy/handoffs
+    nav_tab: Handoffs
+    icon: "🚀"
+    nav_placement: topbar
+    script_path: static/handoff_view.js
+    standalone_pwa: true

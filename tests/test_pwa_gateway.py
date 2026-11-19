@@ -1023,3 +1023,44 @@ async def test_dynamic_plugin_ui_manifest_static_view_and_context_provider(tmp_p
         )
         assert chat_resp.status_code == 200
         assert "DEMO_CONTEXT_BLOCK: battery=99%" in chat_resp.json()["message"]["body_md"]
+
+
+async def test_builtin_handoff_view_plugin_mounts_under_agy_handoffs(tmp_path: Path) -> None:
+    from agy_cloud.core.gateway import MemoryChannelBus, RecordingWorkerJobService
+    from agy_cloud.core.loader import PluginRegistry
+
+    repo_plugins_dir = Path(__file__).resolve().parent.parent / "plugins"
+    registry = PluginRegistry(
+        state_root=tmp_path / "plugin_state",
+        channels=MemoryChannelBus(),
+        jobs=RecordingWorkerJobService(),
+    )
+    await registry.load_all(
+        plugins_dir=repo_plugins_dir,
+        include_entrypoints=False,
+        install_python_deps=False,
+    )
+    assert "handoff_view" in registry.plugins
+
+    _, _, _, gateway, _, _, _ = _make_stack(tmp_path)
+    gateway.plugin_registry = registry
+    app = create_pwa_app(gateway)
+    headers = {"Authorization": "Bearer super-secret-pwa-token"}
+
+    with TestClient(app) as client:
+        ui = client.get("/agy/api/ui/manifest", headers=headers).json()
+        handoff_views = [v for v in ui["views"] if v["id"] == "handoffs"]
+        assert len(handoff_views) == 1
+        assert handoff_views[0]["href"] == "/agy/handoffs/"
+        assert handoff_views[0]["icon"] == "🚀"
+
+        html = client.get("/agy/handoffs/").text
+        assert '<meta name="agy-app-mode" content="handoffs" />' in html
+        assert (
+            '<meta name="agy-view-script" content="./api/plugins/handoff_view/static/handoff_view.js" />'
+            in html
+        )
+
+        js_resp = client.get("/agy/handoffs/api/plugins/handoff_view/static/handoff_view.js")
+        assert js_resp.status_code == 200
+        assert "export function init(core)" in js_resp.text
