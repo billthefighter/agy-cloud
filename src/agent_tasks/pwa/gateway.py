@@ -320,11 +320,18 @@ class _PushSubscribeRequest(BaseModel):
     endpoint: str
     keys: _PushSubKeys
     prefs: dict[str, bool] | None = None
+    app_mode: str | None = None
 
 
 class _PushPrefsRequest(BaseModel):
     endpoint: str
     prefs: dict[str, bool]
+    app_mode: str | None = None
+
+
+class _PushSyncRequest(BaseModel):
+    endpoint: str
+    app_mode: str | None = None
 
 
 class _PushUnsubscribeRequest(BaseModel):
@@ -2456,30 +2463,113 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
         reply = await gateway.on_memory_command("forget", entry_id, "mobile")
         return {"ok": True, "reply": reply}
 
+    prefix_to_mode: dict[str, str] = {}
+
+    def _infer_app_mode(request: Request, explicit: str | None) -> str:
+        if explicit and explicit.strip():
+            return explicit.strip()
+        path = request.url.path or ""
+        for pfx, mode in sorted(prefix_to_mode.items(), key=lambda kv: len(kv[0]), reverse=True):
+            if pfx and (path == pfx or path.startswith(pfx + "/")):
+                return mode
+        return "chat"
+
+    def _normalize_push_prefs(
+        app_mode: str,
+        raw_prefs: dict[str, bool] | None,
+    ) -> dict[str, bool]:
+        manifest = build_ui_manifest(gateway.plugin_registry, base_path=base_path)
+        manifest_cats = manifest.get("push_categories", [])
+        all_keys: set[str] = set(DEFAULT_PUSH_PREFS.keys()) | {
+            str(c["key"]) for c in manifest_cats if c.get("key")
+        }
+        cat_defaults = {
+            str(c["key"]): bool(c.get("default_enabled", True))
+            for c in manifest_cats
+            if c.get("key")
+        }
+        views = manifest.get("views", [])
+        if app_mode != "chat":
+            view = next((v for v in views if v.get("id") == app_mode), None)
+            view_keys = list(view.get("push_category_keys", [])) if view else []
+            if not view_keys and app_mode == "health":
+                view_keys = ["food"]
+            allowed = set(view_keys) | {"ops"}
+            src = raw_prefs or {}
+            return {
+                k: (bool(src.get(k, cat_defaults.get(k, True))) if k in allowed else False)
+                for k in sorted(all_keys)
+            }
+
+        standalone_only_keys: set[str] = {
+            str(k)
+            for v in views
+            if v.get("standalone_pwa")
+            for k in (v.get("push_category_keys") or [])
+        }
+        if health_base_path and health_base_path != base_path and gateway.food_task is not None:
+            standalone_only_keys.add("food")
+        merged: dict[str, bool] = {}
+        for k in sorted(all_keys):
+            default_val = False if k in standalone_only_keys else cat_defaults.get(
+                k, DEFAULT_PUSH_PREFS.get(k, True)
+            )
+            if raw_prefs is not None and k in raw_prefs:
+                merged[k] = bool(raw_prefs[k])
+            else:
+                merged[k] = bool(default_val)
+        return merged
+
     @router.get("/api/push/vapid-public-key", dependencies=[Depends(_require_auth)])
-    async def push_vapid_key() -> dict[str, Any]:
+    async def push_vapid_key(request: Request) -> dict[str, Any]:
+        mode = _infer_app_mode(request, None)
         return {
             "public_key": gateway.push_manager.public_key,
-            "default_prefs": DEFAULT_PUSH_PREFS,
+            "default_prefs": _normalize_push_prefs(mode, None),
+            "app_mode": mode,
         }
 
     @router.post("/api/push/subscribe", dependencies=[Depends(_require_auth)])
     async def push_subscribe(body: _PushSubscribeRequest, request: Request) -> dict[str, Any]:
+        mode = _infer_app_mode(request, body.app_mode)
+        prefs = _normalize_push_prefs(mode, body.prefs)
         sub = gateway.state.upsert_push_subscription(
             endpoint=body.endpoint,
             p256dh=body.keys.p256dh,
             auth=body.keys.auth,
             user_agent=request.headers.get("user-agent", ""),
-            prefs=body.prefs or DEFAULT_PUSH_PREFS,
+            prefs=prefs,
+            app_mode=mode,
         )
-        return {"ok": True, "endpoint": sub.endpoint, "prefs": sub.prefs}
+        return {"ok": True, "endpoint": sub.endpoint, "prefs": sub.prefs, "app_mode": sub.app_mode}
 
     @router.put("/api/push/preferences", dependencies=[Depends(_require_auth)])
-    async def push_prefs(body: _PushPrefsRequest) -> dict[str, Any]:
-        sub = gateway.state.update_push_prefs(body.endpoint, body.prefs)
+    async def push_prefs(body: _PushPrefsRequest, request: Request) -> dict[str, Any]:
+        mode = _infer_app_mode(request, body.app_mode)
+        prefs = _normalize_push_prefs(mode, body.prefs)
+        sub = gateway.state.update_push_prefs(body.endpoint, prefs, app_mode=mode)
         if sub is None:
             raise HTTPException(status_code=404, detail="Push subscription not found.")
-        return {"ok": True, "prefs": sub.prefs}
+        return {"ok": True, "prefs": sub.prefs, "app_mode": sub.app_mode}
+
+    @router.post("/api/push/sync", dependencies=[Depends(_require_auth)])
+    async def push_sync(body: _PushSyncRequest, request: Request) -> dict[str, Any]:
+        sub = gateway.state.get_push_subscription(body.endpoint)
+        if sub is None:
+            return {"found": False}
+        mode = _infer_app_mode(request, body.app_mode)
+        if sub.app_mode != mode:
+            normalized = _normalize_push_prefs(mode, sub.prefs)
+            updated = gateway.state.update_push_prefs(body.endpoint, normalized, app_mode=mode)
+            if updated is not None:
+                sub = updated
+        elif mode != "chat":
+            normalized = _normalize_push_prefs(mode, sub.prefs)
+            if normalized != sub.prefs:
+                updated = gateway.state.update_push_prefs(body.endpoint, normalized, app_mode=mode)
+                if updated is not None:
+                    sub = updated
+        return {"found": True, "app_mode": sub.app_mode, "prefs": sub.prefs}
 
     @router.post("/api/push/unsubscribe", dependencies=[Depends(_require_auth)])
     async def push_unsubscribe(body: _PushUnsubscribeRequest) -> dict[str, Any]:
@@ -2487,12 +2577,15 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
         return {"ok": True, "deleted": deleted}
 
     @router.post("/api/push/test", dependencies=[Depends(_require_auth)])
-    async def push_test() -> dict[str, Any]:
+    async def push_test(request: Request) -> dict[str, Any]:
+        mode = _infer_app_mode(request, None)
+        title = "AGY Health Connected" if mode == "health" else "AGY Tasks Connected"
         counts = await gateway.push_manager.notify(
-            title="AGY Tasks Connected",
+            title=title,
             body="iOS Web Push notifications are live on makesense.",
-            kind="ops",
+            kind="food" if mode == "health" else "ops",
             force=True,
+            target_app_mode=mode,
         )
         return counts
 
@@ -2608,6 +2701,7 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
         short_name="AGY",
         description="Mobile AI chat, repo coding triage, and homelab ops.",
     )
+    prefix_to_mode[base_path] = "chat"
     app.include_router(router, prefix=base_path)
 
     if gateway.plugin_registry is not None:
@@ -2635,6 +2729,7 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
                     description=loaded.manifest.description or view.title,
                     view_script_url=view_script_url,
                 )
+                prefix_to_mode[view_prefix] = view.id
                 app.include_router(router, prefix=view_prefix)
                 mounted_standalone_paths.add(view_prefix)
 
@@ -2651,6 +2746,7 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
             short_name="Health",
             description="Food macro tracker, Garmin readiness, weight trends, and AI nutrition coach.",
         )
+        prefix_to_mode[health_base_path] = "health"
         app.include_router(router, prefix=health_base_path)
 
     return app

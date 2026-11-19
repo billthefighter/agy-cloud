@@ -96,6 +96,7 @@ class WebPushManager:
         thread_id: str | None = None,
         url: str | None = None,
         force: bool = False,
+        target_app_mode: str | None = None,
     ) -> dict[str, int]:
         subs = self.state.list_push_subscriptions()
         if not subs:
@@ -128,7 +129,11 @@ class WebPushManager:
         subject = self.settings.vapid_subject or "mailto:alerts@lodbrok.app"
 
         for sub in subs:
-            if not force and sub.prefs.get(kind, True) is False:
+            if target_app_mode and sub.app_mode != target_app_mode:
+                skipped += 1
+                continue
+            default_allowed = sub.app_mode == "chat"
+            if not force and not sub.prefs.get(kind, default_allowed):
                 skipped += 1
                 continue
 

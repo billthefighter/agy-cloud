@@ -1182,3 +1182,108 @@ async def test_builtin_handoff_view_plugin_mounts_under_agy_handoffs(tmp_path: P
         js_resp = client.get("/agy/handoffs/api/plugins/handoff_view/static/handoff_view.js")
         assert js_resp.status_code == 200
         assert "export function init(core)" in js_resp.text
+
+
+async def test_push_subscriptions_isolated_between_agy_and_health_pwas(tmp_path: Path) -> None:
+    _settings, state, push_mgr, _gateway, _composite, app, _actions = _make_stack(tmp_path)
+    delivered: list[tuple[str, dict[str, object]]] = []
+
+    def _recording_sender(sub_info, data, _priv, _claims):
+        delivered.append((sub_info["endpoint"], json.loads(data)))
+
+    push_mgr._sender = _recording_sender
+    hdr = {"Authorization": "Bearer super-secret-pwa-token", "X-AGY-Client": "pwa"}
+
+    with TestClient(app) as client:
+        # 1) Subscribe /agy (chat) and /health (even if client sends coding=True to /health)
+        agy_sub = client.post(
+            "/agy/api/push/subscribe",
+            headers=hdr,
+            json={
+                "endpoint": "https://push.example/agy-device",
+                "keys": {"p256dh": "k-agy", "auth": "a-agy"},
+            },
+        )
+        assert agy_sub.status_code == 200
+        assert agy_sub.json()["app_mode"] == "chat"
+        assert agy_sub.json()["prefs"]["coding"] is True
+        assert agy_sub.json()["prefs"]["food"] is False
+
+        health_sub = client.post(
+            "/health/api/push/subscribe",
+            headers=hdr,
+            json={
+                "endpoint": "https://push.example/health-device",
+                "keys": {"p256dh": "k-health", "auth": "a-health"},
+                "prefs": {"coding": True, "chat": True, "food": True, "ops": True},
+            },
+        )
+        assert health_sub.status_code == 200
+        assert health_sub.json()["app_mode"] == "health"
+        assert health_sub.json()["prefs"]["food"] is True
+        assert health_sub.json()["prefs"]["ops"] is True
+        assert health_sub.json()["prefs"]["coding"] is False
+        assert health_sub.json()["prefs"]["chat"] is False
+
+        # 2) Coding task failure only pings /agy, NOT /health
+        delivered.clear()
+        coding_counts = await push_mgr.notify(
+            title="Coding task failed",
+            body="pytest exited with code 1",
+            kind="coding",
+            thread_id="coding-123",
+        )
+        assert coding_counts == {"sent": 1, "skipped": 1, "pruned": 0, "failed": 0}
+        assert [ep for ep, _ in delivered] == ["https://push.example/agy-device"]
+
+        # 3) Food notification only pings /health, NOT /agy (by default)
+        delivered.clear()
+        food_counts = await push_mgr.notify(
+            title="Meal logged",
+            body="Chicken bowl — 650 kcal",
+            kind="food",
+        )
+        assert food_counts == {"sent": 1, "skipped": 1, "pruned": 0, "failed": 0}
+        assert [ep for ep, _ in delivered] == ["https://push.example/health-device"]
+
+        # 4) Unknown/future category does not leak into /health
+        delivered.clear()
+        future_counts = await push_mgr.notify(
+            title="Future alert",
+            body="New plugin category",
+            kind="future_plugin",
+        )
+        assert future_counts == {"sent": 1, "skipped": 1, "pruned": 0, "failed": 0}
+        assert [ep for ep, _ in delivered] == ["https://push.example/agy-device"]
+
+        # 5) Test push is scoped to the PWA endpoint that triggered it
+        delivered.clear()
+        health_test = client.post("/health/api/push/test", headers=hdr)
+        assert health_test.status_code == 200
+        assert health_test.json()["sent"] == 1
+        assert [ep for ep, _ in delivered] == ["https://push.example/health-device"]
+
+        delivered.clear()
+        agy_test = client.post("/agy/api/push/test", headers=hdr)
+        assert agy_test.status_code == 200
+        assert agy_test.json()["sent"] == 1
+        assert [ep for ep, _ in delivered] == ["https://push.example/agy-device"]
+
+        # 6) Legacy /health subscription migrated as app_mode='chat' with coding=True self-heals on sync
+        state.upsert_push_subscription(
+            endpoint="https://push.example/legacy-health",
+            p256dh="k-leg",
+            auth="a-leg",
+            prefs={"coding": True, "chat": True, "food": True, "ops": True},
+            app_mode="chat",
+        )
+        sync_resp = client.post(
+            "/health/api/push/sync",
+            headers=hdr,
+            json={"endpoint": "https://push.example/legacy-health", "app_mode": "health"},
+        )
+        assert sync_resp.status_code == 200
+        assert sync_resp.json()["found"] is True
+        assert sync_resp.json()["app_mode"] == "health"
+        assert sync_resp.json()["prefs"]["coding"] is False
+        assert sync_resp.json()["prefs"]["food"] is True

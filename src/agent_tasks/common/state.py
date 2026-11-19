@@ -113,6 +113,7 @@ class PushSubscriptionRecord:
     prefs: dict[str, bool] = field(default_factory=dict)
     created_at: str = ""
     last_sent_at: str | None = None
+    app_mode: str = "chat"
 
 
 class StateStore:
@@ -373,10 +374,19 @@ class StateStore:
                     user_agent TEXT NOT NULL DEFAULT '',
                     prefs_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
-                    last_sent_at TEXT
+                    last_sent_at TEXT,
+                    app_mode TEXT NOT NULL DEFAULT 'chat'
                 );
                 """
             )
+            push_cols = {
+                str(r["name"])
+                for r in conn.execute("PRAGMA table_info(pwa_push_subscriptions)").fetchall()
+            }
+            if "app_mode" not in push_cols:
+                conn.execute(
+                    "ALTER TABLE pwa_push_subscriptions ADD COLUMN app_mode TEXT NOT NULL DEFAULT 'chat'"
+                )
 
     @staticmethod
     def _now() -> str:
@@ -1274,6 +1284,8 @@ class StateStore:
             )
         except (ValueError, TypeError):
             prefs = {}
+        row_keys = set(row.keys())
+        app_mode = str(row["app_mode"] or "chat") if "app_mode" in row_keys else "chat"
         return PushSubscriptionRecord(
             endpoint=str(row["endpoint"]),
             p256dh=str(row["p256dh"]),
@@ -1282,6 +1294,7 @@ class StateStore:
             prefs=prefs,
             created_at=str(row["created_at"]),
             last_sent_at=row["last_sent_at"],
+            app_mode=app_mode,
         )
 
     @staticmethod
@@ -1732,6 +1745,13 @@ class StateStore:
             ).fetchall()
             return [self._row_to_pwa_message(r) for r in rows]
 
+    def get_push_subscription(self, endpoint: str) -> PushSubscriptionRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM pwa_push_subscriptions WHERE endpoint = ?", (endpoint,)
+            ).fetchone()
+            return self._row_to_push_sub(row) if row else None
+
     def upsert_push_subscription(
         self,
         *,
@@ -1740,15 +1760,17 @@ class StateStore:
         auth: str,
         user_agent: str = "",
         prefs: dict[str, bool] | None = None,
+        app_mode: str = "chat",
     ) -> PushSubscriptionRecord:
         now = self._now()
+        clean_mode = (app_mode or "chat").strip() or "chat"
         prefs_json = json.dumps(prefs or {})
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO pwa_push_subscriptions (
-                    endpoint, p256dh, auth, user_agent, prefs_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    endpoint, p256dh, auth, user_agent, prefs_json, created_at, app_mode
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(endpoint) DO UPDATE SET
                     p256dh = excluded.p256dh,
                     auth = excluded.auth,
@@ -1759,9 +1781,13 @@ class StateStore:
                     prefs_json = CASE
                         WHEN excluded.prefs_json != '{}' THEN excluded.prefs_json
                         ELSE pwa_push_subscriptions.prefs_json
+                    END,
+                    app_mode = CASE
+                        WHEN excluded.app_mode != '' THEN excluded.app_mode
+                        ELSE pwa_push_subscriptions.app_mode
                     END
                 """,
-                (endpoint, p256dh, auth, user_agent[:250], prefs_json, now),
+                (endpoint, p256dh, auth, user_agent[:250], prefs_json, now, clean_mode),
             )
             row = conn.execute(
                 "SELECT * FROM pwa_push_subscriptions WHERE endpoint = ?", (endpoint,)
@@ -1774,14 +1800,24 @@ class StateStore:
             return cur.rowcount > 0
 
     def update_push_prefs(
-        self, endpoint: str, prefs: dict[str, bool]
+        self,
+        endpoint: str,
+        prefs: dict[str, bool],
+        *,
+        app_mode: str | None = None,
     ) -> PushSubscriptionRecord | None:
         clean_prefs = {str(k): bool(v) for k, v in prefs.items()}
         with self._connect() as conn:
-            cur = conn.execute(
-                "UPDATE pwa_push_subscriptions SET prefs_json = ? WHERE endpoint = ?",
-                (json.dumps(clean_prefs), endpoint),
-            )
+            if app_mode is not None and app_mode.strip():
+                cur = conn.execute(
+                    "UPDATE pwa_push_subscriptions SET prefs_json = ?, app_mode = ? WHERE endpoint = ?",
+                    (json.dumps(clean_prefs), app_mode.strip(), endpoint),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE pwa_push_subscriptions SET prefs_json = ? WHERE endpoint = ?",
+                    (json.dumps(clean_prefs), endpoint),
+                )
             if cur.rowcount == 0:
                 return None
             row = conn.execute(

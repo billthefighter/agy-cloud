@@ -310,6 +310,56 @@ export function updateWsDot() {
   }
 }
 
+function defaultPushPrefsForMode(manifest) {
+  const categories = manifest?.push_categories?.length
+    ? manifest.push_categories
+    : CORE_PUSH_CATEGORIES;
+  const views = manifest?.views || [];
+  if (appMode !== "chat") {
+    const currentView = views.find((v) => v.id === appMode);
+    const viewKeys =
+      currentView && Array.isArray(currentView.push_category_keys) && currentView.push_category_keys.length
+        ? currentView.push_category_keys
+        : appMode === "health"
+          ? ["food"]
+          : [];
+    const allowed = new Set([...viewKeys, "ops"]);
+    const prefs = {};
+    for (const cat of categories) {
+      prefs[cat.key] = allowed.has(cat.key) ? cat.default_enabled !== false : false;
+    }
+    return prefs;
+  }
+  const standaloneOnly = new Set(
+    views
+      .filter((v) => v.standalone_pwa && Array.isArray(v.push_category_keys))
+      .flatMap((v) => v.push_category_keys)
+  );
+  const prefs = {};
+  for (const cat of categories) {
+    prefs[cat.key] = standaloneOnly.has(cat.key) ? false : cat.default_enabled !== false;
+  }
+  return prefs;
+}
+
+export async function syncExistingPushSubscription() {
+  if (!state.pushSub) return;
+  try {
+    const subJson = state.pushSub.toJSON();
+    if (!subJson?.endpoint) return;
+    const res = await apiFetch("api/push/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ endpoint: subJson.endpoint, app_mode: appMode }),
+    });
+    if (res?.found && res.prefs && typeof res.prefs === "object") {
+      state.pushPrefs = { ...defaultPushPrefsForMode(state.uiManifest), ...res.prefs };
+    }
+  } catch (err) {
+    console.warn("Push subscription sync skipped:", err);
+  }
+}
+
 export async function loadUiManifest() {
   try {
     const manifest = await apiFetch("api/ui/manifest");
@@ -328,11 +378,7 @@ export async function loadUiManifest() {
           ? manifest.chat_context_providers
           : [],
       };
-      for (const cat of state.uiManifest.push_categories) {
-        if (!(cat.key in state.pushPrefs)) {
-          state.pushPrefs[cat.key] = cat.default_enabled !== false;
-        }
-      }
+      state.pushPrefs = defaultPushPrefsForMode(state.uiManifest);
       for (const cp of state.uiManifest.chat_context_providers) {
         if (!(cp.id in state.newContextProviders)) {
           state.newContextProviders[cp.id] = Boolean(cp.default_enabled);
@@ -342,6 +388,7 @@ export async function loadUiManifest() {
   } catch (err) {
     console.warn("UI manifest load skipped:", err);
   }
+  await syncExistingPushSubscription();
 }
 
 export async function handleLogin(tokenStr, { rethrow = false } = {}) {
@@ -403,15 +450,19 @@ export async function enableWebPush() {
       });
     }
     const subJson = sub.toJSON();
-    await apiFetch("api/push/subscribe", {
+    const res = await apiFetch("api/push/subscribe", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         endpoint: subJson.endpoint,
         keys: subJson.keys,
         prefs: state.pushPrefs,
+        app_mode: appMode,
       }),
     });
+    if (res?.prefs && typeof res.prefs === "object") {
+      state.pushPrefs = { ...defaultPushPrefsForMode(state.uiManifest), ...res.prefs };
+    }
     state.pushSub = sub;
     render();
     toast("iOS Web Push enabled!");
@@ -433,11 +484,14 @@ export async function savePushPrefs() {
   if (!state.pushSub) return;
   try {
     const subJson = state.pushSub.toJSON();
-    await apiFetch("api/push/preferences", {
+    const res = await apiFetch("api/push/preferences", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ endpoint: subJson.endpoint, prefs: state.pushPrefs }),
+      body: JSON.stringify({ endpoint: subJson.endpoint, prefs: state.pushPrefs, app_mode: appMode }),
     });
+    if (res?.prefs && typeof res.prefs === "object") {
+      state.pushPrefs = { ...defaultPushPrefsForMode(state.uiManifest), ...res.prefs };
+    }
     toast("Notification preferences saved.");
   } catch (err) {
     toast(err.message);
