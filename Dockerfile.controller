@@ -4,20 +4,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     ca-certificates \
     curl \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -u 1000 agy \
+    && mkdir -p /app /state \
+    && chown -R agy:agy /app /state
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 WORKDIR /app
-COPY pyproject.toml README.md ./
-COPY src ./src
-COPY plugins ./plugins
-COPY skills ./skills
 
-RUN uv pip install --system --no-cache ".[k8s,slack,worker]" \
-    && useradd -m -u 1000 agy \
-    && mkdir -p /state \
-    && chown -R agy:agy /app /state
+# Install third-party dependencies in a cached layer before copying source code.
+COPY pyproject.toml uv.lock ./
+RUN uv export --frozen --no-dev --no-hashes --no-emit-project --extra k8s --extra slack --extra worker -o /tmp/requirements.txt \
+    && uv pip install --system --no-cache -r /tmp/requirements.txt \
+    && rm -f /tmp/requirements.txt
+
+COPY --chown=agy:agy README.md ./
+COPY --chown=agy:agy src ./src
+COPY --chown=agy:agy plugins ./plugins
+COPY --chown=agy:agy skills ./skills
+
+RUN uv pip install --system --no-cache --no-deps .
 
 USER 1000:1000
 EXPOSE 8080

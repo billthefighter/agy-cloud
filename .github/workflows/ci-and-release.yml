@@ -1,10 +1,24 @@
-name: CI & Multi-Arch Release
+name: CI & Selective Image Release
 
 on:
   push:
     branches: ["main"]
     tags: ["v*"]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      build_controller:
+        description: "Build and push controller image"
+        type: boolean
+        default: true
+      build_worker:
+        description: "Build and push worker image"
+        type: boolean
+        default: true
+      multi_arch:
+        description: "Build multi-arch (linux/amd64,linux/arm64)"
+        type: boolean
+        default: false
 
 jobs:
   test:
@@ -19,64 +33,211 @@ jobs:
           uv run ruff check .
           uv run pytest -v
 
-  docker:
-    needs: test
-    if: github.event_name == 'push' && !contains(github.event.head_commit.message, '[skip ci]')
+  changes:
+    if: >-
+      (github.event_name == 'push' && !contains(github.event.head_commit.message, '[skip ci]')) ||
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      packages: write
+    outputs:
+      controller: ${{ steps.plan.outputs.controller }}
+      worker: ${{ steps.plan.outputs.worker }}
+      platforms: ${{ steps.plan.outputs.platforms }}
+      tag: ${{ steps.plan.outputs.tag }}
+      release_tag: ${{ steps.plan.outputs.release_tag }}
     steps:
       - uses: actions/checkout@v4
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         with:
           fetch-depth: 0
-      - name: Compute immutable image tag
-        id: meta
+      - uses: dorny/paths-filter@v3
+        id: filter
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          filters: |
+            controller:
+              - 'Dockerfile.controller'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - 'src/**'
+              - 'plugins/**'
+            worker:
+              - 'Dockerfile.worker'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - 'src/agent_tasks/worker_main.py'
+              - 'src/agent_tasks/common/**'
+      - name: Determine build plan
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          FILTER_CONTROLLER: ${{ steps.filter.outputs.controller }}
+          FILTER_WORKER: ${{ steps.filter.outputs.worker }}
+          INPUT_CONTROLLER: ${{ inputs.build_controller }}
+          INPUT_WORKER: ${{ inputs.build_worker }}
+          INPUT_MULTI_ARCH: ${{ inputs.multi_arch }}
         run: |
           SHORT_SHA="${GITHUB_SHA::7}"
           echo "tag=sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+          if [[ "$REF" == refs/tags/v* ]]; then
+            echo "controller=true" >> "$GITHUB_OUTPUT"
+            echo "worker=true" >> "$GITHUB_OUTPUT"
+            echo "platforms=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
+            echo "release_tag=${REF_NAME}" >> "$GITHUB_OUTPUT"
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "controller=${INPUT_CONTROLLER:-false}" >> "$GITHUB_OUTPUT"
+            echo "worker=${INPUT_WORKER:-false}" >> "$GITHUB_OUTPUT"
+            if [[ "${INPUT_MULTI_ARCH}" == "true" ]]; then
+              echo "platforms=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
+            else
+              echo "platforms=linux/amd64" >> "$GITHUB_OUTPUT"
+            fi
+            echo "release_tag=" >> "$GITHUB_OUTPUT"
+          else
+            echo "controller=${FILTER_CONTROLLER:-false}" >> "$GITHUB_OUTPUT"
+            echo "worker=${FILTER_WORKER:-false}" >> "$GITHUB_OUTPUT"
+            echo "platforms=linux/amd64" >> "$GITHUB_OUTPUT"
+            echo "release_tag=" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-controller:
+    needs: [test, changes]
+    if: needs.changes.outputs.controller == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
+        if: contains(needs.changes.outputs.platforms, 'arm64')
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push multi-arch controller image
+      - name: Compute tags
+        id: tags
+        env:
+          TAG: ${{ needs.changes.outputs.tag }}
+          RELEASE_TAG: ${{ needs.changes.outputs.release_tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          {
+            echo "list<<EOF"
+            echo "ghcr.io/${REPO}/controller:latest"
+            echo "ghcr.io/${REPO}/controller:${TAG}"
+            if [[ -n "$RELEASE_TAG" ]]; then
+              echo "ghcr.io/${REPO}/controller:${RELEASE_TAG}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Build and push controller image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile.controller
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ needs.changes.outputs.platforms }}
           push: true
-          tags: |
-            ghcr.io/${{ github.repository }}/controller:latest
-            ghcr.io/${{ github.repository }}/controller:${{ steps.meta.outputs.tag }}
-      - name: Build and push multi-arch worker image
+          tags: ${{ steps.tags.outputs.list }}
+          cache-from: type=gha,scope=controller
+          cache-to: type=gha,mode=max,scope=controller
+
+  build-worker:
+    needs: [test, changes]
+    if: needs.changes.outputs.worker == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        if: contains(needs.changes.outputs.platforms, 'arm64')
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute tags
+        id: tags
+        env:
+          TAG: ${{ needs.changes.outputs.tag }}
+          RELEASE_TAG: ${{ needs.changes.outputs.release_tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          {
+            echo "list<<EOF"
+            echo "ghcr.io/${REPO}/worker:latest"
+            echo "ghcr.io/${REPO}/worker:${TAG}"
+            if [[ -n "$RELEASE_TAG" ]]; then
+              echo "ghcr.io/${REPO}/worker:${RELEASE_TAG}"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Build and push worker image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile.worker
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ needs.changes.outputs.platforms }}
           push: true
-          tags: |
-            ghcr.io/${{ github.repository }}/worker:latest
-            ghcr.io/${{ github.repository }}/worker:${{ steps.meta.outputs.tag }}
-      - name: Pin controller & worker image tags in deploy/k3s
-        if: github.ref == 'refs/heads/main'
+          tags: ${{ steps.tags.outputs.list }}
+          cache-from: type=gha,scope=worker
+          cache-to: type=gha,mode=max,scope=worker
+
+  pin-manifests:
+    needs: [changes, build-controller, build-worker]
+    if: >-
+      always() &&
+      github.ref == 'refs/heads/main' &&
+      (needs.changes.outputs.controller == 'true' || needs.changes.outputs.worker == 'true') &&
+      (needs.build-controller.result == 'success' || needs.build-controller.result == 'skipped') &&
+      (needs.build-worker.result == 'success' || needs.build-worker.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Pin rebuilt image tags in deploy/k3s
+        env:
+          TAG: ${{ needs.changes.outputs.tag }}
+          BUILT_CONTROLLER: ${{ needs.changes.outputs.controller }}
+          BUILT_WORKER: ${{ needs.changes.outputs.worker }}
         run: |
-          TAG="${{ steps.meta.outputs.tag }}"
           MANIFEST="deploy/k3s/controller-deployment.yaml"
-          sed -i -E "s|(ghcr\.io/billthefighter/agy-cloud/controller):[^[:space:]]+|\1:${TAG}|g" "$MANIFEST"
-          sed -i -E "s|(ghcr\.io/billthefighter/agy-cloud/worker):[^[:space:]]+|\1:${TAG}|g" "$MANIFEST"
+          UPDATED=()
+
+          if [[ "$BUILT_CONTROLLER" == "true" ]]; then
+            sed -i -E "s|(ghcr\.io/billthefighter/agy-cloud/controller):[^[:space:]]+|\1:${TAG}|g" "$MANIFEST"
+            UPDATED+=("controller")
+          fi
+          if [[ "$BUILT_WORKER" == "true" ]]; then
+            sed -i -E "s|(ghcr\.io/billthefighter/agy-cloud/worker):[^[:space:]]+|\1:${TAG}|g" "$MANIFEST"
+            UPDATED+=("worker")
+          fi
+
           if git diff --quiet "$MANIFEST"; then
             echo "Manifest already pinned to ${TAG}"
             exit 0
           fi
+
+          if [[ "${#UPDATED[@]}" -eq 2 ]]; then
+            LABEL="controller & worker images"
+          else
+            LABEL="${UPDATED[0]} image"
+          fi
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "$MANIFEST"
-          git commit -m "chore(deploy): pin controller & worker images to ${TAG} [skip ci]"
+          git commit -m "chore(deploy): pin ${LABEL} to ${TAG} [skip ci]"
           for i in 1 2 3; do
             if git push origin HEAD:main; then
               exit 0
