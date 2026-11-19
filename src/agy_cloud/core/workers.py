@@ -55,6 +55,9 @@ def build_k8s_worker_job_dict(
         {"name": "WORK_DIR", "value": "/work"},
         {"name": "SESSION_DIR", "value": "/session"},
         {"name": "ARTIFACTS_DIR", "value": "/artifacts"},
+        {"name": "GIT_CONFIG_COUNT", "value": "1"},
+        {"name": "GIT_CONFIG_KEY_0", "value": "safe.directory"},
+        {"name": "GIT_CONFIG_VALUE_0", "value": "*"},
     ]
     if use_agy_cli:
         worker_env.extend(

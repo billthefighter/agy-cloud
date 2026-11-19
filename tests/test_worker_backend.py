@@ -12,6 +12,7 @@ from agent_tasks.common.config import (
     TargetsConfig,
     resolve_worker_backend,
     resolve_worker_model_for_cli,
+    resolve_worker_model_for_sdk,
 )
 from agent_tasks.common.models import IssueStatus, WorkerEnvelope
 from agent_tasks.common.state import IssueRecord
@@ -52,7 +53,14 @@ def test_resolve_worker_backend_defaults_and_overrides() -> None:
 def test_resolve_worker_model_for_cli() -> None:
     assert resolve_worker_model_for_cli("gemini-4-hydrogen") == "gemini-4-hydrogen-medium"
     assert resolve_worker_model_for_cli("gemini-4-neon") == "gemini-4-neon-medium"
+    assert resolve_worker_model_for_cli("neon") == "gemini-4-neon-medium"
+    assert resolve_worker_model_for_cli("neon-high") == "gemini-4-neon-high"
+    assert resolve_worker_model_for_cli("gemini-4-neon-high") == "gemini-4-neon-high"
     assert resolve_worker_model_for_cli("claude-sonnet-5-5-medium") == "claude-sonnet-5-5-medium"
+    # SDK strips effort tiers on Gemini models so effort-qualified handoffs still work on sdk
+    assert resolve_worker_model_for_sdk("gemini-4-neon-high") == "gemini-4-neon"
+    assert resolve_worker_model_for_sdk("neon-low") == "gemini-4-neon"
+    assert resolve_worker_model_for_sdk("gemini-4-hydrogen") == "gemini-4-hydrogen"
 
 
 def test_k8s_job_manifest_mounts_agy_auth_for_agy_cli() -> None:
@@ -85,6 +93,13 @@ def test_k8s_job_manifest_mounts_agy_auth_for_agy_cli() -> None:
     assert env_map["WORKER_BACKEND"] == "agy_cli"
     assert env_map["HOME"] == "/home/agy"
     assert env_map["TZ"] == "UTC"
+    assert env_map["GIT_CONFIG_COUNT"] == "1"
+    assert env_map["GIT_CONFIG_KEY_0"] == "safe.directory"
+    assert env_map["GIT_CONFIG_VALUE_0"] == "*"
+    init_c = cli_job.spec.template.spec.init_containers[0]
+    init_env = {e.name: e.value for e in init_c.env}
+    assert init_env["GIT_CONFIG_VALUE_0"] == "*"
+    assert "exit 1" in init_c.command[2]
     assert worker.env_from[0].secret_ref.optional is True
     assert any(
         m.mount_path == "/home/agy/.gemini" and m.sub_path == "agy-auth"
@@ -115,6 +130,9 @@ def test_microkernel_worker_job_dict_and_handoff_default_agy_cli(tmp_path: Path)
     container = manifest["spec"]["template"]["spec"]["containers"][0]
     env_map = {e["name"]: e["value"] for e in container["env"]}
     assert env_map["WORKER_BACKEND"] == "agy_cli"
+    assert env_map["GIT_CONFIG_COUNT"] == "1"
+    assert env_map["GIT_CONFIG_KEY_0"] == "safe.directory"
+    assert env_map["GIT_CONFIG_VALUE_0"] == "*"
     assert container["envFrom"][0]["secretRef"]["optional"] is True
     assert any(
         m.get("subPath") == "agy-auth" and m.get("mountPath") == "/home/agy/.gemini"
@@ -266,3 +284,118 @@ def test_sync_agy_config_repo_creates_relative_symlinks(tmp_path: Path) -> None:
     sync_agy_config_repo_sync(agy_auth, str(src_repo), "", branch="main")
     assert not (config_dir / "skills" / "doomloop").exists()
     assert not (config_dir / "skills" / "doomloop").is_symlink()
+
+
+@pytest.mark.asyncio
+async def test_run_worker_preserves_report_and_usage_when_git_diff_capture_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work_dir = tmp_path / "work"
+    session_dir = tmp_path / "session"
+    artifacts_dir = tmp_path / "artifacts"
+    memory_dir = tmp_path / "memory"
+    work_dir.mkdir()
+    artifacts_dir.mkdir()
+    memory_dir.mkdir()
+    # Deliberately do NOT init a git repo in work_dir so _capture_git_diff fails
+    (artifacts_dir / "task_prompt.md").write_text("Diagnose missing repo", encoding="utf-8")
+
+    fake_agy = tmp_path / "fake-agy"
+    fake_agy.write_text(
+        """#!/usr/bin/env python3
+import json
+print(json.dumps({
+    "conversation_id": "conv-preserve-1",
+    "status": "SUCCESS",
+    "structured_output": {
+        "root_cause": "Missing base commit in workspace",
+        "confidence": "high",
+        "affected_files": [],
+        "fix_summary": "No changes applied.",
+        "verification_commands": [],
+        "tests_passed": False,
+        "risk_notes": "Re-dispatch with pushed branch.",
+        "should_notify": True,
+    },
+    "usage": {
+        "input_tokens": 500,
+        "output_tokens": 100,
+        "thinking_tokens": 25,
+        "cache_read_tokens": 0,
+        "total_tokens": 625,
+    },
+}))
+""",
+        encoding="utf-8",
+    )
+    fake_agy.chmod(fake_agy.stat().st_mode | stat.S_IEXEC)
+
+    monkeypatch.setenv("ISSUE_ID", "handoff-preserve-1")
+    monkeypatch.setenv("SHORT_ID", "HANDOFF-PRESERVE")
+    monkeypatch.setenv("PROJECT_SLUG", "demo")
+    monkeypatch.setenv("TURN", "1")
+    monkeypatch.setenv("WORK_DIR", str(work_dir))
+    monkeypatch.setenv("SESSION_DIR", str(session_dir))
+    monkeypatch.setenv("ARTIFACTS_DIR", str(artifacts_dir))
+    monkeypatch.setenv("MEMORY_DIR", str(memory_dir))
+    monkeypatch.setenv("WORKER_BACKEND", "agy_cli")
+    monkeypatch.setenv("WORKER_MODEL", "gemini-4-hydrogen")
+    monkeypatch.setenv("AGY_CLI_BIN", str(fake_agy))
+
+    with pytest.raises(RuntimeError, match="git diff capture failed"):
+        await run_worker()
+
+    envelope = WorkerEnvelope.model_validate_json(
+        (artifacts_dir / "result.json").read_text(encoding="utf-8")
+    )
+    assert envelope.error is not None
+    assert "git diff capture failed" in envelope.error
+    assert envelope.conversation_id == "conv-preserve-1"
+    assert envelope.report is not None
+    assert "Missing base commit" in envelope.report.root_cause
+    assert envelope.usage.total_tokens == 625
+
+
+@pytest.mark.asyncio
+async def test_slack_coding_handoff_preserves_model_and_effort_from_handoff_meta(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    from agent_tasks.common.state import StateStore
+    from agent_tasks.tasks.slack_coding.task import SlackCodingTask
+
+    state = StateStore(tmp_path / "state.db")
+    settings = ControllerSettings(
+        state_dir=tmp_path,
+        targets_config_path=tmp_path / "missing-targets.yaml",
+        target_github_token="ghp_test",
+    )
+    task = SlackCodingTask(settings=settings, state=state)
+
+    thread_ts = "1795060000.123456"
+    issue_id = f"slack-{thread_ts.replace('.', '-')}"
+    art_dir = tmp_path / "artifacts" / issue_id
+    art_dir.mkdir(parents=True, exist_ok=True)
+    (art_dir / "handoff_meta.json").write_text(
+        json.dumps(
+            {
+                "is_handoff": True,
+                "repo": "lodbrok-app/rattlsnek",
+                "branch": "main",
+                "model": "gemini-4-neon-high",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    ack = await task.handle_coding_request(
+        prompt_text="repo:lodbrok-app/rattlsnek Finish burn down",
+        user="laptop-handoff",
+        thread_ts=thread_ts,
+        channel_id="pwa:coding",
+    )
+    assert "gemini-4-neon-high" in ack
+    rec = state.get_by_thread_ts(thread_ts)
+    assert rec is not None
+    assert rec.model_override == "gemini-4-neon-high"

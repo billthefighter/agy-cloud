@@ -191,21 +191,20 @@ def test_k8s_job_manifest_enforces_makesense_rwo_affinity_and_secret_isolation(
         assert forbidden not in serialized
 
 
-def test_targets_configmap_validates_all_lodbrok_projects() -> None:
-    cm_path = Path(__file__).resolve().parents[1] / "deploy" / "k3s" / "configmap-targets.yaml"
+def test_targets_configmap_validates_generic_public_defaults() -> None:
+    deploy_dir = Path(__file__).resolve().parents[1] / "deploy" / "k3s"
     import yaml
 
-    cm = yaml.safe_load(cm_path.read_text(encoding="utf-8"))
+    raw_cm = (deploy_dir / "configmap-targets.yaml").read_text(encoding="utf-8")
+    raw_ingress = (deploy_dir / "pwa-ingress.yaml").read_text(encoding="utf-8")
+    cm = yaml.safe_load(raw_cm)
     cfg = TargetsConfig.model_validate(yaml.safe_load(cm["data"]["targets.yaml"]))
-    assert cfg.sentry.organization_slug == "lodbrok"
-    assert set(cfg.projects.keys()) == {
-        "python-fastapi",
-        "python-fastapi-staging",
-        "javascript-astro",
-        "javascript-astro-staging",
-        "python-edge",
-        "python-edge-staging",
-    }
+    assert cfg.sentry.organization_slug == "example-org"
+    assert cfg.projects == {}
+    assert cfg.ci_healer.repos == []
+    for private_token in ("lodbrok", "rattlsnek", "makesense"):
+        assert private_token not in raw_cm.lower()
+        assert private_token not in raw_ingress.lower()
 
 
 def test_bare_mirror_config_never_persists_token(tmp_path: Path) -> None:

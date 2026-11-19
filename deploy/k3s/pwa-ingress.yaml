@@ -9,17 +9,15 @@ spec:
   secretName: agent-tasks-pwa-tls
   duration: 8760h
   renewBefore: 720h
-  commonName: makesense-k3s.netbird.cloud
+  commonName: agy-cloud.example.com
   dnsNames:
-    - makesense-k3s.netbird.cloud
-    - rattlsnek-dev-k3s.netbird.cloud
-    - argocd.home.lan
+    - agy-cloud.example.com
   usages:
     - digital signature
     - key encipherment
     - server auth
   issuerRef:
-    name: homelab-ca
+    name: your-cluster-issuer
     kind: ClusterIssuer
     group: cert-manager.io
 ---
@@ -37,46 +35,10 @@ spec:
   ingressClassName: traefik
   tls:
     - hosts:
-        - makesense-k3s.netbird.cloud
-        - rattlsnek-dev-k3s.netbird.cloud
-        - argocd.home.lan
+        - agy-cloud.example.com
       secretName: agent-tasks-pwa-tls
   rules:
-    - host: makesense-k3s.netbird.cloud
-      http:
-        paths:
-          - path: /agy
-            pathType: Prefix
-            backend:
-              service:
-                name: agent-tasks-pwa
-                port:
-                  number: 8080
-          - path: /health
-            pathType: Prefix
-            backend:
-              service:
-                name: agent-tasks-pwa
-                port:
-                  number: 8080
-    - host: rattlsnek-dev-k3s.netbird.cloud
-      http:
-        paths:
-          - path: /agy
-            pathType: Prefix
-            backend:
-              service:
-                name: agent-tasks-pwa
-                port:
-                  number: 8080
-          - path: /health
-            pathType: Prefix
-            backend:
-              service:
-                name: agent-tasks-pwa
-                port:
-                  number: 8080
-    - host: argocd.home.lan
+    - host: agy-cloud.example.com
       http:
         paths:
           - path: /agy

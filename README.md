@@ -226,9 +226,27 @@ GEMINI_API_KEY="AIza..." AGY_CLOUD_TOKEN="dev-local-token" docker compose up --b
      --from-literal=SLACK_ENABLED="false"
    ```
 
-2. **Deploy via Kustomize or Helm**:
+2. **Deploy via Kustomize Overlay or Helm**:
+   `deploy/k3s/` ships **generic placeholder defaults** (`example-org/example-repo`, `agy-cloud.example.com`, and optional background monitors disabled) so this repository remains reusable and free of private org or cluster config.
+
+   For production/GitOps deployments, keep your real repositories, Sentry org slugs, ingress hostnames, and personal plugin settings in a **private Kustomize overlay** (for example, `deploy/k3s/` inside your private `agy-cloud-private-plugins` repository) that references this repo as a remote base:
+   ```yaml
+   # In your private repo: deploy/k3s/kustomization.yaml
+   apiVersion: kustomize.config.k8s.io/v1beta1
+   kind: Kustomization
+   namespace: agent-tasks
+   resources:
+     - https://github.com/billthefighter/agy-cloud//deploy/k3s?ref=main
+   patches:
+     - path: configmap-targets.yaml
+     - path: pwa-ingress.yaml
+   ```
+   Then point ArgoCD (with read credentials for your private repo) or `kubectl apply -k` at your private overlay instead of modifying `agy-cloud/deploy/k3s/` directly:
    ```bash
-   # Kustomize (deploy/k3s or deploy/k8s/base):
+   # Apply your private Kustomize overlay (recommended):
+   kubectl apply -k path/to/your-private-repo/deploy/k3s
+
+   # Or deploy the generic base directly for quick testing:
    kubectl apply -k deploy/k3s
 
    # Or via Helm:

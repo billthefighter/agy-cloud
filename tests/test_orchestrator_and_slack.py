@@ -142,15 +142,18 @@ def test_k8s_job_manifest_uses_hydrogen_default_override_and_clone_ref(tmp_path:
     assert worker_env["WORKER_MODEL"] == "gemini-4-carbon"
 
 
-def test_manifests_configure_hydrogen_clusterrole_and_all_automations() -> None:
+def test_manifests_configure_hydrogen_clusterrole_and_generic_defaults() -> None:
     deploy_dir = Path(__file__).resolve().parents[1] / "deploy" / "k3s"
 
     cm = yaml.safe_load((deploy_dir / "configmap-targets.yaml").read_text(encoding="utf-8"))
     cfg = TargetsConfig.model_validate(yaml.safe_load(cm["data"]["targets.yaml"]))
-    assert cfg.slack_coding.enabled is True
-    assert cfg.ci_healer.enabled is True
-    assert cfg.k8s_watchdog.enabled is True
-    assert cfg.dep_upgrader.enabled is True
+    assert cfg.sentry.organization_slug == "example-org"
+    assert cfg.projects == {}
+    assert cfg.slack_coding.enabled is False
+    assert cfg.ci_healer.enabled is False
+    assert cfg.k8s_watchdog.enabled is False
+    assert cfg.dep_upgrader.enabled is False
+    assert cfg.billing.enabled is True
 
     dep = yaml.safe_load((deploy_dir / "controller-deployment.yaml").read_text(encoding="utf-8"))
     env_map = {

@@ -35,10 +35,38 @@ CLI_MODEL_DEFAULTS: dict[str, str] = {
 }
 
 
+_EFFORT_TIERS = ("low", "medium", "high")
+
+
 def resolve_worker_model_for_cli(model: str) -> str:
-    """Map an SDK-style model ID to an `agy` CLI model ID (preserving explicit CLI IDs)."""
+    """Map an SDK-style or shorthand model ID to an `agy` CLI model ID (preserving explicit IDs)."""
     clean = (model or "").strip() or DEFAULT_WORKER_MODEL
+    lower = clean.lower()
+    if lower in MODEL_ALIASES:
+        clean = MODEL_ALIASES[lower]
+    else:
+        for tier in _EFFORT_TIERS:
+            suffix = f"-{tier}"
+            if lower.endswith(suffix):
+                stem = lower[: -len(suffix)]
+                if stem in MODEL_ALIASES:
+                    return f"{MODEL_ALIASES[stem]}{suffix}"
     return CLI_MODEL_DEFAULTS.get(clean, clean)
+
+
+def resolve_worker_model_for_sdk(model: str) -> str:
+    """Normalize a model ID for the `google-antigravity` SDK (stripping CLI effort suffixes)."""
+    clean = (model or "").strip() or DEFAULT_WORKER_MODEL
+    lower = clean.lower()
+    if lower in MODEL_ALIASES:
+        return MODEL_ALIASES[lower]
+    for tier in _EFFORT_TIERS:
+        suffix = f"-{tier}"
+        if lower.endswith(suffix):
+            stem = lower[: -len(suffix)]
+            if stem in MODEL_ALIASES:
+                return MODEL_ALIASES[stem]
+    return clean
 
 
 def normalize_worker_backend(value: str | None) -> WorkerBackend | None:

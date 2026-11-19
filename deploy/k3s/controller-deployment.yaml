@@ -9,8 +9,8 @@ metadata:
     app.kubernetes.io/part-of: agent-tasks
 spec:
   replicas: 1
-  # Recreate is mandatory so multi-node makesense local-path ReadWriteOnce PVC
-  # never deadlocks during controller rollouts.
+  # Recreate is mandatory so multi-node local-path ReadWriteOnce PVCs
+  # never deadlock during controller rollouts.
   strategy:
     type: Recreate
   selector:

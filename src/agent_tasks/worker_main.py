@@ -15,6 +15,7 @@ from agent_tasks.common.config import (
     normalize_worker_backend,
     resolve_gemini_auth,
     resolve_worker_model_for_cli,
+    resolve_worker_model_for_sdk,
 )
 from agent_tasks.common.memory import load_worker_memory_context
 from agent_tasks.common.models import TokenUsageSummary, TriageReport, WorkerEnvelope
@@ -119,20 +120,29 @@ def _build_prompt(
 
 def _capture_git_diff(work_dir: Path) -> tuple[str, str]:
     # Track new untracked source files with intent-to-add so `git diff HEAD` includes them,
-    # while respecting the target repo's .gitignore.
-    subprocess.run(["git", "-C", str(work_dir), "add", "-N", "."], check=False)
-    diff_proc = subprocess.run(
-        ["git", "-C", str(work_dir), "diff", "--binary", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    stat_proc = subprocess.run(
-        ["git", "-C", str(work_dir), "diff", "--stat", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    # while respecting the target repo's .gitignore. Pass `-c safe.directory=*` so ownership
+    # differences between the git-clone initContainer and worker container never trigger
+    # `dubious ownership` (which causes `git diff --binary HEAD` to exit with status 129).
+    git_prefix = ["git", "-c", "safe.directory=*", "-C", str(work_dir)]
+    subprocess.run([*git_prefix, "add", "-N", "."], check=False, capture_output=True, text=True)
+    try:
+        diff_proc = subprocess.run(
+            [*git_prefix, "diff", "--binary", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        stat_proc = subprocess.run(
+            [*git_prefix, "diff", "--stat", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        raise RuntimeError(
+            f"git diff capture failed (exit {exc.returncode}) in {work_dir}: {detail or exc}"
+        ) from exc
     return diff_proc.stdout, stat_proc.stdout.strip()
 
 
@@ -282,8 +292,9 @@ async def _run_sdk_worker(
     ]
 
     api_key, use_vertex = resolve_gemini_auth(os.environ)
+    sdk_model = resolve_worker_model_for_sdk(worker_model)
     agent_cfg = LocalAgentConfig(
-        model=worker_model,
+        model=sdk_model,
         api_key=api_key,
         vertex=use_vertex,
         system_instructions=effective_instructions,
@@ -323,7 +334,7 @@ async def _run_sdk_worker(
                 total_tokens=int(getattr(raw_usage, "total_token_count", 0) or 0),
             )
     report = TriageReport.model_validate(raw_report) if raw_report else None
-    return report, conv_id, stop_reason, usage_summary, worker_model
+    return report, conv_id, stop_reason, usage_summary, sdk_model
 
 
 async def run_worker() -> None:
@@ -367,6 +378,11 @@ async def run_worker() -> None:
         worker_backend=worker_backend,
         timeout_seconds=timeout_seconds,
     )
+    report: TriageReport | None = None
+    conv_id = existing_conv_id or ""
+    stop_reason = "UNSPECIFIED"
+    usage_summary = TokenUsageSummary()
+    effective_model = worker_model
     try:
         if worker_backend == "agy_cli":
             report, conv_id, stop_reason, usage_summary, effective_model = (
@@ -426,9 +442,12 @@ async def run_worker() -> None:
         envelope = WorkerEnvelope(
             issue_id=issue_id,
             turn=turn,
-            conversation_id=existing_conv_id or "",
-            model=worker_model,
+            conversation_id=conv_id,
+            model=effective_model,
             worker_backend=worker_backend,
+            stop_reason=stop_reason,
+            report=report,
+            usage=usage_summary,
             error=err_detail,
         )
         (artifacts_dir / "result.json").write_text(

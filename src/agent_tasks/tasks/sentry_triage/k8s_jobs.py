@@ -50,7 +50,10 @@ def build_triage_job_manifest(
         "if [ -s /artifacts/base_sha.txt ]; then\n"
         "  BASE_SHA=\"$(tr -d '[:space:]' < /artifacts/base_sha.txt)\"\n"
         '  if [ -n "$BASE_SHA" ]; then\n'
-        '    git checkout "$BASE_SHA" 2>/dev/null || echo "Note: BASE_SHA $BASE_SHA not in mirror; staying on $CLONE_REF"\n'
+        '    if ! git checkout "$BASE_SHA" 2>/dev/null; then\n'
+        '      echo "ERROR: BASE_SHA $BASE_SHA not found in /mirror (branch $CLONE_REF). Push your base branch or re-run handoff." >&2\n'
+        "      exit 1\n"
+        "    fi\n"
         "  fi\n"
         "fi\n"
         "if [ -s /artifacts/fix.patch ]; then\n"
@@ -62,6 +65,12 @@ def build_triage_job_manifest(
     clone_ref = record.base_ref or record.default_branch
     worker_model = record.model_override or settings.worker_model
 
+    git_safe_dir_env = [
+        client.V1EnvVar(name="GIT_CONFIG_COUNT", value="1"),
+        client.V1EnvVar(name="GIT_CONFIG_KEY_0", value="safe.directory"),
+        client.V1EnvVar(name="GIT_CONFIG_VALUE_0", value="*"),
+    ]
+
     init_container = client.V1Container(
         name="git-clone",
         image=settings.worker_image,
@@ -71,6 +80,7 @@ def build_triage_job_manifest(
             client.V1EnvVar(name="DEFAULT_BRANCH", value=record.default_branch),
             client.V1EnvVar(name="CLONE_REF", value=clone_ref),
             client.V1EnvVar(name="TURN", value=str(record.turn)),
+            *git_safe_dir_env,
         ],
         security_context=client.V1SecurityContext(
             allow_privilege_escalation=False,
@@ -112,6 +122,7 @@ def build_triage_job_manifest(
         client.V1EnvVar(name="MEMORY_DIR", value="/memory"),
         client.V1EnvVar(name="UV_CACHE_DIR", value="/caches/uv"),
         client.V1EnvVar(name="npm_config_cache", value="/caches/npm"),
+        *git_safe_dir_env,
     ]
     if use_agy_cli:
         worker_env.extend(

@@ -252,6 +252,8 @@ class SlackCodingTask:
         if str(handoff_meta.get("verify_hint") or "").strip():
             verify_hint = str(handoff_meta["verify_hint"]).strip()
         custom_title = str(handoff_meta.get("title") or "").strip()
+        handoff_model = str(handoff_meta.get("model") or "").strip()
+        effective_model_override = model_override or handoff_model or None
         base_sha = str(handoff_meta.get("base_sha") or "").strip()
         had_base_patch = bool(handoff_meta.get("had_base_patch"))
         source_conv_id = str(handoff_meta.get("source_conversation_id") or "").strip()
@@ -286,7 +288,7 @@ class SlackCodingTask:
             permalink=f"https://github.com/{github_repo}",
             task_kind="slack_coding",
             base_ref=branch_override or None,
-            model_override=model_override,
+            model_override=effective_model_override,
             thread_ts=thread_ts,
             channel_id=channel_id,
         )
@@ -297,7 +299,7 @@ class SlackCodingTask:
         if self._dispatch_callback is not None:
             await self._dispatch_callback()
 
-        model_label = model_override or self.settings.worker_model
+        model_label = effective_model_override or self.settings.worker_model
         log.info(
             "slack_coding.queued",
             issue_id=issue_id,

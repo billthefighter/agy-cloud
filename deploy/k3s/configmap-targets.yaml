@@ -4,9 +4,13 @@ metadata:
   name: agent-tasks-targets
   namespace: agent-tasks
 data:
+  # Generic example configuration for agy-cloud.
+  # Override this ConfigMap via a private Kustomize overlay (e.g., in your
+  # private config/plugins repository) rather than committing org-specific
+  # repos, Sentry slugs, or personal settings directly into agy-cloud.
   targets.yaml: |
     sentry:
-      organization_slug: lodbrok
+      organization_slug: example-org
       base_url: https://us.sentry.io
       poll_interval_seconds: 180
       lookback_query: "is:unresolved firstSeen:-24h"
@@ -16,90 +20,62 @@ data:
       regression_cooldown_seconds: 3600
       worker_backend: sdk
 
-    projects:
-      python-fastapi:
-        github_repo: lodbrok-app/rattlsnek
-        default_branch: main
-        focus_subdir: rattlsnek
-        verify_hint: "cd rattlsnek && uv sync --package api --package shared && uv run ruff check . && uv run ty check && uv run pytest <targeted_unit_test_files> (no local Postgres runs on localhost:5432 in isolated triage pods)"
-      python-fastapi-staging:
-        github_repo: lodbrok-app/rattlsnek
-        default_branch: main
-        focus_subdir: rattlsnek
-        verify_hint: "cd rattlsnek && uv sync --package api --package shared && uv run ruff check . && uv run ty check && uv run pytest <targeted_unit_test_files> (no local Postgres runs on localhost:5432 in isolated triage pods)"
-      javascript-astro:
-        github_repo: lodbrok-app/rattlsnek
-        default_branch: main
-        focus_subdir: web
-        verify_hint: "cd web && npm ci --ignore-scripts && npm test && npm run typecheck"
-      javascript-astro-staging:
-        github_repo: lodbrok-app/rattlsnek
-        default_branch: main
-        focus_subdir: web
-        verify_hint: "cd web && npm ci --ignore-scripts && npm test && npm run typecheck"
-      python-edge:
-        github_repo: lodbrok-app/rattlsnek
-        default_branch: main
-        focus_subdir: rattlsnek
-        verify_hint: "cd rattlsnek && uv sync --package edge --package edge_utils && uv run ruff check edge edge_utils && uv run ty check edge edge_utils && uv run pytest edge edge_utils"
-      python-edge-staging:
-        github_repo: lodbrok-app/rattlsnek
-        default_branch: main
-        focus_subdir: rattlsnek
-        verify_hint: "cd rattlsnek && uv sync --package edge --package edge_utils && uv run ruff check edge edge_utils && uv run ty check edge edge_utils && uv run pytest edge edge_utils"
+    projects: {}
+      # example-service:
+      #   github_repo: example-org/example-repo
+      #   default_branch: main
+      #   focus_subdir: ""
+      #   verify_hint: "pytest"
 
     slack_coding:
-      enabled: true
-      github_repo: lodbrok-app/rattlsnek
+      enabled: false
+      github_repo: example-org/example-repo
       default_branch: main
       focus_subdir: ""
-      verify_hint: "cd rattlsnek && uv sync --package edge --package edge_utils && uv run ruff check . && uv run ty check"
+      verify_hint: "pytest"
       worker_backend: sdk
       handoff_worker_backend: agy_cli
 
     ci_healer:
-      enabled: true
+      enabled: false
       poll_interval_seconds: 180
       lookback_hours: 6
       settle_seconds: 90
       cooldown_seconds: 3600
       worker_backend: sdk
-      repos:
-        - github_repo: lodbrok-app/rattlsnek
-          default_branch: main
-          verify_hint: "cd rattlsnek && uv run ruff check . && uv run ty check"
+      repos: []
+        # - github_repo: example-org/example-repo
+        #   default_branch: main
+        #   verify_hint: "pytest"
 
     k8s_watchdog:
-      enabled: true
+      enabled: false
       poll_interval_seconds: 120
       settle_polls: 2
       argo_out_of_sync_polls: 15
       recovery_polls: 3
       reopen_cooldown_seconds: 21600
       watched_namespaces:
-        - rattlsnek
-        - monitoring
-        - argocd
         - agent-tasks
       ignored_argo_apps:
         - root
         - agent-tasks
-      github_repo: lodbrok-app/rattlsnek
+      github_repo: example-org/example-repo
       default_branch: main
-      verify_hint: "cd rattlsnek && uv run ruff check ."
+      verify_hint: ""
       worker_backend: sdk
 
     dep_upgrader:
-      enabled: true
+      enabled: false
       interval_seconds: 604800
-      github_repo: lodbrok-app/rattlsnek
+      github_repo: example-org/example-repo
       default_branch: main
-      verify_hint: "cd rattlsnek && uv sync --package edge --package edge_utils && uv run ruff check edge edge_utils && uv run pytest edge edge_utils"
+      verify_hint: "pytest"
       worker_backend: sdk
 
     agy_config:
-      enabled: true
-      github_repo: billthefighter/agy-config
+      enabled: false
+      github_repo: ""
       branch: main
 
     channels:
@@ -123,26 +99,4 @@ data:
       hard_stop_pct: 95.0
 
     food_tracker:
-      enabled: true
-      timezone: America/Los_Angeles
-      day_rollover_hour: 3
-      default_calories_kcal: 2450
-      default_protein_g: 195.0
-      default_carbs_g: 250.0
-      default_fat_g: 75.0
-      default_fiber_g: 35.0
-      evening_digest_enabled: true
-      evening_digest_hour: 20
-      evening_digest_minute: 30
-      daily_backup_enabled: true
-      backup_keep_days: 14
-      garmin_enabled: true
-      garmin_sync_interval_seconds: 900
-      garmin_lookback_days: 7
-      garmin_sync_weight: true
-      garmin_dynamic_targets_enabled: true
-      garmin_dynamic_mode: rolling_baseline
-      garmin_active_factor: 0.80
-      garmin_goal_delta_kcal: 0
-      garmin_min_calories_kcal: 1600
-      garmin_max_calories_kcal: 4000
+      enabled: false
