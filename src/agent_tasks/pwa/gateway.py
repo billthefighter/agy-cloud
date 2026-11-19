@@ -2581,7 +2581,7 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
                     continue
                 rel_script = view.script_path.removeprefix("static/") if view.script_path else ""
                 view_script_url = (
-                    f"./api/plugins/{pid}/static/{rel_script}" if rel_script else ""
+                    f"{view_prefix}/api/plugins/{pid}/static/{rel_script}" if rel_script else ""
                 )
                 _mount_pwa_shell(
                     view_prefix,

@@ -4,7 +4,8 @@ import { initChatMode } from "./chat_view.js";
 async function start() {
   if (viewScript) {
     try {
-      const mod = await import(viewScript);
+      const resolvedUrl = new URL(viewScript, document.baseURI).href;
+      const mod = await import(resolvedUrl);
       if (typeof mod.init === "function") {
         mod.init(coreApi);
       } else if (typeof mod.default === "function") {

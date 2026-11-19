@@ -1004,7 +1004,7 @@ async def test_dynamic_plugin_ui_manifest_static_view_and_context_provider(tmp_p
         widget_html = client.get("/widget/").text
         assert '<meta name="agy-app-mode" content="widget" />' in widget_html
         assert (
-            '<meta name="agy-view-script" content="./api/plugins/demo_ui/static/widget.js" />'
+            '<meta name="agy-view-script" content="/widget/api/plugins/demo_ui/static/widget.js" />'
             in widget_html
         )
         assert "agy-health-base" not in widget_html
@@ -1057,7 +1057,7 @@ async def test_builtin_handoff_view_plugin_mounts_under_agy_handoffs(tmp_path: P
         html = client.get("/agy/handoffs/").text
         assert '<meta name="agy-app-mode" content="handoffs" />' in html
         assert (
-            '<meta name="agy-view-script" content="./api/plugins/handoff_view/static/handoff_view.js" />'
+            '<meta name="agy-view-script" content="/agy/handoffs/api/plugins/handoff_view/static/handoff_view.js" />'
             in html
         )
 
