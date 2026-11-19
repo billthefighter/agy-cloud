@@ -35,7 +35,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: controller
-          image: ghcr.io/billthefighter/agy-cloud/controller:latest
+          image: ghcr.io/billthefighter/agy-cloud/controller:sha-3470495
           imagePullPolicy: Always
           command: ["agent-tasks-controller"]
           args: []
@@ -59,7 +59,7 @@ spec:
             - name: TARGETS_CONFIG_PATH
               value: /etc/agent-tasks/targets.yaml
             - name: WORKER_IMAGE
-              value: ghcr.io/billthefighter/agy-cloud/worker:latest
+              value: ghcr.io/billthefighter/agy-cloud/worker:sha-3470495
             - name: WORKER_MODEL
               value: gemini-4-hydrogen
             - name: WORKER_SERVICE_ACCOUNT
