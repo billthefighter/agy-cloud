@@ -9,10 +9,16 @@ metadata:
     app.kubernetes.io/part-of: agent-tasks
 spec:
   replicas: 1
-  # Recreate is mandatory so multi-node local-path ReadWriteOnce PVCs
-  # never deadlock during controller rollouts.
+  # RollingUpdate with maxSurge: 1 / maxUnavailable: 0 gives zero-downtime PWA
+  # rollouts on k3s local-path RWO PVCs: the PV's nodeAffinity pins the surge
+  # pod to the same node (RWO permits multi-pod mounts on a single node), while
+  # controller_main holds an exclusive flock on /state/.controller.lock so only
+  # one pod runs Slack Socket Mode and background pollers at a time.
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app.kubernetes.io/name: agent-tasks-controller

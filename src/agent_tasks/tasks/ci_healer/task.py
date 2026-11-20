@@ -137,19 +137,22 @@ class CiHealerTask:
             log.debug("ci_healer.disabled")
             return 0
 
-        token = self.settings.target_github_token.strip()
-        if not token:
-            log.warning("ci_healer.polling_skipped", reason="TARGET_GITHUB_TOKEN is empty")
-            return 0
-
-        client = self._make_actions_client(token)
         now = datetime.now(UTC)
         cutoff = now - timedelta(hours=cfg.ci_healer.lookback_hours)
         settle_cutoff = now - timedelta(seconds=max(0, cfg.ci_healer.settle_seconds))
         self._last_runs_by_repo.clear()
         newly_queued = 0
+        clients_by_token: dict[str, GitHubActionsClient] = {}
 
         for repo_cfg in cfg.ci_healer.repos:
+            token = self.settings.resolve_github_token(repo_cfg.github_repo).strip()
+            if not token:
+                log.warning("ci_healer.repo_token_missing", repo=repo_cfg.github_repo)
+                continue
+            client = clients_by_token.get(token)
+            if client is None:
+                client = self._make_actions_client(token)
+                clients_by_token[token] = client
             try:
                 runs = await client.list_failed_runs(repo_cfg.github_repo)
             except Exception:
@@ -425,13 +428,23 @@ class CiHealerTask:
 
         if not cfg.ci_healer.enabled:
             lines.append("• *Polling:* disabled (`ci_healer.enabled=false`)")
-        elif not self.settings.target_github_token.strip():
+        elif not self.settings.target_github_token.strip() and not self.settings.github_tokens:
             lines.append("• *Polling:* skipped (`TARGET_GITHUB_TOKEN` empty)")
         else:
-            client = self._make_actions_client(self.settings.target_github_token.strip())
+            clients_by_token: dict[str, GitHubActionsClient] = {}
             for repo_cfg in cfg.ci_healer.repos:
                 runs = self._last_runs_by_repo.get(repo_cfg.github_repo)
                 if runs is None:
+                    token = self.settings.resolve_github_token(repo_cfg.github_repo).strip()
+                    if not token:
+                        lines.append(
+                            f"• *Repo `{repo_cfg.github_repo}`:* skipped (no GitHub token)"
+                        )
+                        continue
+                    client = clients_by_token.get(token)
+                    if client is None:
+                        client = self._make_actions_client(token)
+                        clients_by_token[token] = client
                     try:
                         runs = await client.list_failed_runs(repo_cfg.github_repo)
                     except Exception as exc:

@@ -57,6 +57,11 @@ from agent_tasks.pwa.auth import SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECONDS, P
 from agent_tasks.pwa.push import DEFAULT_PUSH_PREFS, WebPushManager
 from agent_tasks.tasks.billing_guard.pricing import compute_billing_cycle
 from agent_tasks.tasks.direct_chat import DirectChatService
+from agent_tasks.tasks.sentry_triage.git_ops import (
+    RepoSnapshotTooLargeError,
+    check_github_repo_access,
+    validate_and_write_repo_snapshot,
+)
 from agy_cloud.core.gateway import build_ui_manifest
 
 if TYPE_CHECKING:
@@ -236,6 +241,7 @@ class _HandoffCreateRequest(BaseModel):
     base_sha: str = ""
     base_patch: str = ""
     patch: str = ""
+    repo_snapshot_b64: str = ""
     semantic_state: str = ""
     verify_hint: str = ""
     focus_subdir: str = ""
@@ -267,6 +273,11 @@ class _ThreadActionRequest(BaseModel):
 
 class _ScaleFoodRequest(BaseModel):
     multiplier: float
+
+
+class _LogAgainRequest(BaseModel):
+    logged_at: str = ""
+    local_date: str = ""
 
 
 class _MealReactionRequest(BaseModel):
@@ -625,6 +636,9 @@ class PwaGatewayAdapter:
             "last_error": record.last_error or envelope_error or None,
             "updated_at": record.updated_at,
             "had_base_patch": bool(meta.get("had_base_patch") or has_initial_patch),
+            "has_repo_snapshot": bool(
+                meta.get("has_repo_snapshot") or (art_dir / "repo_snapshot.tar.gz").is_file()
+            ),
             "has_patch": bool(diff_text.strip()),
             "patch_stats": patch_stats,
             "stop_reason": stop_reason,
@@ -1705,12 +1719,28 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
         art_dir.mkdir(parents=True, exist_ok=True)
         (gateway.settings.state_dir / "sessions" / issue_id).mkdir(parents=True, exist_ok=True)
 
+        has_repo_snapshot = False
+        repo_snapshot_bytes = 0
+        if body.repo_snapshot_b64.strip():
+            try:
+                repo_snapshot_bytes = validate_and_write_repo_snapshot(
+                    body.repo_snapshot_b64,
+                    art_dir / "repo_snapshot.tar.gz",
+                )
+            except RepoSnapshotTooLargeError as exc:
+                raise HTTPException(status_code=413, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            has_repo_snapshot = True
+
         meta_payload = {
             "is_handoff": True,
             "repo": repo,
             "branch": branch,
             "base_sha": base_sha,
             "had_base_patch": had_base_patch,
+            "has_repo_snapshot": has_repo_snapshot,
+            "repo_snapshot_bytes": repo_snapshot_bytes,
             "verify_hint": body.verify_hint.strip(),
             "focus_subdir": body.focus_subdir.strip(),
             "model": selected_model or gateway.settings.worker_model,
@@ -1817,6 +1847,26 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
         )
         return {
             "handoffs": [gateway._build_handoff_payload(r, include_diff=False) for r in records],
+        }
+
+    @router.get("/api/handoff/repo-access", dependencies=[Depends(_require_auth)])
+    async def check_handoff_repo_access(
+        repo: str = Query(default=""),
+    ) -> dict[str, Any]:
+        clean_repo = repo.strip()
+        if not clean_repo:
+            raise HTTPException(status_code=400, detail="Query parameter `repo` is required.")
+        token = gateway.settings.resolve_github_token(clean_repo)
+        accessible, has_mirror, reason = await check_github_repo_access(
+            gateway.settings.state_dir / "mirrors",
+            clean_repo,
+            token,
+        )
+        return {
+            "repo": clean_repo,
+            "accessible": accessible,
+            "has_mirror": has_mirror,
+            "reason": reason,
         }
 
     @router.get("/api/handoff/{handoff_id}", dependencies=[Depends(_require_auth)])
@@ -2268,6 +2318,83 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
         await gateway.on_food_save_staple(entry_id, "mobile")
         return gateway._build_food_today_payload()
 
+    @router.post("/api/food/entries/{entry_id}/log-again", dependencies=[Depends(_require_auth)])
+    async def food_log_again(entry_id: int, body: _LogAgainRequest | None = None) -> dict[str, Any]:
+        if gateway.food_task is None:
+            raise HTTPException(status_code=503, detail="Food tracker is not enabled.")
+        src = gateway.food_task.nutrition.get_meal_entry(entry_id)
+        if src is None:
+            raise HTTPException(status_code=404, detail=f"Meal entry #{entry_id} not found.")
+
+        from zoneinfo import ZoneInfo
+
+        from agent_tasks.tasks.food_tracker.models import EstimatedMealItem, MealEstimateSchema
+        from agent_tasks.tasks.food_tracker.store import effective_local_date
+
+        cfg = gateway._load_targets().food_tracker
+        req = body or _LogAgainRequest()
+        logged_at_iso: str | None = None
+        target_dt_utc: datetime | None = None
+        if req.logged_at.strip():
+            try:
+                parsed = datetime.fromisoformat(req.logged_at.strip().replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Invalid logged_at timestamp.") from exc
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=ZoneInfo(cfg.timezone))
+            target_dt_utc = parsed.astimezone(UTC)
+            logged_at_iso = target_dt_utc.isoformat()
+
+        effective_date = req.local_date.strip() or effective_local_date(
+            target_dt_utc or datetime.now(UTC),
+            tz_name=cfg.timezone,
+            rollover_hour=cfg.day_rollover_hour,
+        )
+
+        estimate = MealEstimateSchema(
+            title=src.title,
+            meal_slot=src.meal_slot,
+            confidence=src.confidence,
+            assumptions_note=src.assumptions_note or "",
+            clarification_question="",
+            items=[
+                EstimatedMealItem(
+                    name=it.name,
+                    quantity_desc=it.quantity_desc,
+                    estimated_grams=it.estimated_grams,
+                    calories_kcal=it.calories_kcal,
+                    protein_g=it.protein_g,
+                    carbs_g=it.carbs_g,
+                    fat_g=it.fat_g,
+                    fiber_g=it.fiber_g,
+                    source=it.source,
+                )
+                for it in src.items
+            ],
+        )
+        cloned = gateway.food_task.nutrition.create_meal_entry(
+            local_date=effective_date,
+            estimate=estimate,
+            raw_description=src.raw_description,
+            model_used="log-again",
+            photo_relpath=src.photo_relpath,
+            scale_factor=src.scale_factor,
+            logged_at=logged_at_iso,
+            reasoning_trace=src.reasoning_trace,
+        )
+        await gateway.broadcast(
+            "food.updated",
+            {
+                "source": "log_again",
+                "entry_id": cloned.id,
+                "meal_title": cloned.title,
+                "calories_kcal": cloned.total_calories_kcal,
+                "protein_g": cloned.total_protein_g,
+                "local_date": cloned.local_date,
+            },
+        )
+        return gateway._build_food_today_payload(local_date=cloned.local_date)
+
     @router.delete("/api/food/entries/{entry_id}", dependencies=[Depends(_require_auth)])
     async def food_delete(entry_id: int) -> dict[str, Any]:
         if gateway.on_food_delete is None:
@@ -2554,8 +2681,10 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
             standalone_only_keys.add("food")
         merged: dict[str, bool] = {}
         for k in sorted(all_keys):
-            default_val = False if k in standalone_only_keys else cat_defaults.get(
-                k, DEFAULT_PUSH_PREFS.get(k, True)
+            default_val = (
+                False
+                if k in standalone_only_keys
+                else cat_defaults.get(k, DEFAULT_PUSH_PREFS.get(k, True))
             )
             if raw_prefs is not None and k in raw_prefs:
                 merged[k] = bool(raw_prefs[k])

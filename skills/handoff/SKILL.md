@@ -64,10 +64,16 @@ Use this skill when the user invokes `/handoff` (or asks to hand off a task to t
        --handoff-id "<handoff_id_or_empty_for_latest>"
      ```
 
+## Submodules, Private Repos & On-the-Fly Snapshots
+
+- **Git Submodules / Nested Repos:** If the user's task targets files inside a git submodule (e.g. `gitops/apps/agy-cloud-private-plugins`), pass that submodule directory directly as `--workdir` (or pass `--focus-subdir <submodule_path>`). In Git, a superproject's `git diff HEAD` omits file edits inside submodules, so targeting the submodule directly ensures remote diffs capture and apply cleanly. (`handoff_client.py` also auto-detects single-submodule targets from `--focus-subdir` or `--prompt`, retargets to the submodule, and remembers `target_workdir` for subsequent `watch`/`pull`/`status` calls.)
+- **Private Repos & Local-Only Repos (Automatic Snapshot Fallback):** Before posting to `/api/handoff`, `handoff_client.py` queries `GET /api/handoff/repo-access?repo=<owner/name>`. If the k3s cluster cannot mirror the target repository (e.g. a private repo/submodule whose owner isn't covered by controller secrets, or a local-only git repo), `handoff_client.py` automatically packs a compressed `HEAD` snapshot (`git archive --format=tar.gz HEAD`) and uploads it on-the-fly alongside any uncommitted diff — no k3s credentials needed and zero GitHub tokens ever enter the worker pod. Pass `--upload-repo` to force snapshot upload (or `--no-upload-repo` to disable automatic fallback).
+- **Per-Owner / Per-Repo GitHub Secrets on k3s (Optional):** To let the controller mirror private repos directly (and enable Slack/PWA coding tasks & Draft PRs on them), add `GITHUB_TOKEN_<OWNER>` (e.g. `GITHUB_TOKEN_BILLTHEFIGHTER`) or `GITHUB_TOKENS_JSON` (`{"owner": "ghp_...", "owner/repo": "github_pat_..."}`) to `agent-tasks-controller-secret` on k3s.
+
 ## Configuration Discovery
 
 `handoff_client.py` resolves connection settings automatically in priority order:
 1. CLI flags (`--url`, `--token`, `--ca-cert`, `--insecure`)
 2. Environment variables (`AGY_HANDOFF_URL`, `AGY_HANDOFF_TOKEN`, `PWA_API_TOKEN`)
-3. Workspace `.agy-handoff.env`, `.env`, or `.env.makesense`
+3. Workspace (and parent directory) `.agy-handoff.env`, `.env`, or `.env.makesense`
 4. User config `~/.config/agy-cloud/config.env`

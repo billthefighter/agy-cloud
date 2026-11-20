@@ -53,6 +53,7 @@ def _build_task_prompt(
     request_text: str,
     base_sha: str = "",
     had_base_patch: bool = False,
+    has_repo_snapshot: bool = False,
     source_conversation_id: str = "",
 ) -> str:
     """Build `/state/artifacts/<issue_id>/task_prompt.md` instructions for the worker pod."""
@@ -67,6 +68,11 @@ def _build_task_prompt(
     ]
     if base_sha:
         lines.append(f"- **Base Commit SHA:** `{base_sha}`")
+    if has_repo_snapshot:
+        lines.append(
+            "- **Workspace Source:** Uploaded `HEAD` snapshot from the user's laptop "
+            "(self-contained checkout in `/work`; no external GitHub remote is required)."
+        )
     if source_conversation_id:
         lines.append(f"- **Source Laptop Conversation ID:** `{source_conversation_id}`")
     if focus_subdir:
@@ -256,6 +262,10 @@ class SlackCodingTask:
         effective_model_override = model_override or handoff_model or None
         base_sha = str(handoff_meta.get("base_sha") or "").strip()
         had_base_patch = bool(handoff_meta.get("had_base_patch"))
+        has_repo_snapshot = (
+            bool(handoff_meta.get("has_repo_snapshot"))
+            or (art_dir / "repo_snapshot.tar.gz").is_file()
+        )
         source_conv_id = str(handoff_meta.get("source_conversation_id") or "").strip()
 
         (art_dir / "task_prompt.md").write_text(
@@ -269,6 +279,7 @@ class SlackCodingTask:
                 request_text=cleaned_prompt,
                 base_sha=base_sha,
                 had_base_patch=had_base_patch,
+                has_repo_snapshot=has_repo_snapshot,
                 source_conversation_id=source_conv_id,
             ),
             encoding="utf-8",

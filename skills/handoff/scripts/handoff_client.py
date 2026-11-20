@@ -13,6 +13,7 @@ Supports:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -37,6 +38,7 @@ TERMINAL_STATUSES = {
     "ignored",
 }
 DEFAULT_MAX_INLINE_PATCH_BYTES = 5 * 1024 * 1024  # 5 MiB
+DEFAULT_MAX_SNAPSHOT_BYTES = 20 * 1024 * 1024  # 20 MiB compressed
 
 _MODEL_SHORTHANDS: dict[str, str] = {
     "hydrogen": "gemini-4-hydrogen",
@@ -85,37 +87,245 @@ def _parse_dotenv_file(path: Path) -> dict[str, str]:
     return out
 
 
+def _extract_conn_from_mapping(mapping: dict[str, str]) -> tuple[str, str, str]:
+    netbird_host = mapping.get("NETBIRD_HOSTNAME", "").strip()
+    netbird_url = f"https://{netbird_host}.netbird.cloud/agy" if netbird_host else ""
+    url = (
+        mapping.get("AGY_HANDOFF_URL", "").strip()
+        or mapping.get("AGY_CLOUD_URL", "").strip()
+        or netbird_url
+    )
+    token = (
+        mapping.get("AGY_HANDOFF_TOKEN", "").strip()
+        or mapping.get("AGY_CLOUD_TOKEN", "").strip()
+        or mapping.get("PWA_API_TOKEN", "").strip()
+    )
+    ca_cert = mapping.get("AGY_HANDOFF_CA_CERT", "").strip()
+    return url, token, ca_cert
+
+
 def resolve_connection_config(
     workdir: Path,
     *,
     explicit_url: str = "",
     explicit_token: str = "",
 ) -> tuple[str, str, str]:
-    """Resolve `(base_url, api_token, ca_bundle_or_empty)` from flags, env, dotenv, or ~/.config."""
-    env_vars: dict[str, str] = {}
-    for candidate in [
-        Path.home() / ".config" / "agy-cloud" / "config.env",
-        workdir / ".agy-handoff.env",
-        workdir / ".env",
-    ]:
-        env_vars.update(_parse_dotenv_file(candidate))
-    env_vars.update(os.environ)
+    """Resolve `(base_url, api_token, ca_bundle_or_empty)` from flags, env, workspace dotenv, or ~/.config."""
+    # Layers ordered highest -> lowest priority:
+    # 1. Explicit CLI flags
+    # 2. Process environment variables
+    # 3. Workspace (and parent directory) .agy-handoff.env / .env / .env.makesense (innermost first)
+    # 4. User config ~/.config/agy-cloud/config.env
+    layers: list[dict[str, str]] = [dict(os.environ)]
+    for folder in [workdir, *list(workdir.parents)[:4]]:
+        for fname in (".agy-handoff.env", ".env", ".env.makesense"):
+            parsed = _parse_dotenv_file(folder / fname)
+            if parsed:
+                layers.append(parsed)
+    user_cfg = _parse_dotenv_file(Path.home() / ".config" / "agy-cloud" / "config.env")
+    if user_cfg:
+        layers.append(user_cfg)
 
-    url = (
-        explicit_url.strip()
-        or env_vars.get("AGY_HANDOFF_URL", "").strip()
-        or env_vars.get("AGY_CLOUD_URL", "").strip()
-        or "http://localhost:8080"
-    ).rstrip("/")
+    url = explicit_url.strip()
+    token = explicit_token.strip()
+    ca_cert = ""
+    for layer in layers:
+        l_url, l_tok, l_ca = _extract_conn_from_mapping(layer)
+        if not url and l_url:
+            url = l_url
+        if not token and l_tok:
+            token = l_tok
+        if not ca_cert and l_ca:
+            ca_cert = l_ca
 
-    token = (
-        explicit_token.strip()
-        or env_vars.get("AGY_HANDOFF_TOKEN", "").strip()
-        or env_vars.get("AGY_CLOUD_TOKEN", "").strip()
-        or env_vars.get("PWA_API_TOKEN", "").strip()
+    return (url or "http://localhost:8080").rstrip("/"), token, ca_cert
+
+
+def _git_toplevel(path: Path) -> Path | None:
+    proc = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+        check=False,
+        capture_output=True,
+        text=True,
     )
-    ca_cert = env_vars.get("AGY_HANDOFF_CA_CERT", "").strip()
-    return url, token, ca_cert
+    if proc.returncode == 0 and proc.stdout.strip():
+        return Path(proc.stdout.strip()).resolve()
+    return None
+
+
+def _list_checked_out_submodules(workdir: Path) -> list[str]:
+    """Return relative POSIX paths of checked-out git submodules declared in `.gitmodules`."""
+    gitmodules = workdir / ".gitmodules"
+    if not gitmodules.is_file():
+        return []
+    proc = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(workdir),
+            "config",
+            "--file",
+            ".gitmodules",
+            "--get-regexp",
+            r"^submodule\..*\.path$",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return []
+    submodules: list[str] = []
+    for line in proc.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        rel = parts[1].strip().strip("/")
+        if rel and (workdir / rel / ".git").exists():
+            submodules.append(rel)
+    return submodules
+
+
+def _rewrite_verify_hint_for_submodule(verify_hint: str, sub_rel: str) -> str:
+    if not verify_hint or not sub_rel:
+        return verify_hint
+    prefix = f"{sub_rel.rstrip('/')}/"
+    updated = verify_hint.replace(prefix, "")
+    updated = re.sub(
+        rf"(?<![A-Za-z0-9_./-]){re.escape(sub_rel.rstrip('/'))}(?=$|[\s,:;)'\"])",
+        ".",
+        updated,
+    )
+    return updated
+
+
+def resolve_effective_workdir(
+    workdir: Path,
+    *,
+    focus_subdir: str = "",
+    prompt: str = "",
+    verify_hint: str = "",
+) -> tuple[Path, str, str, str]:
+    """Detect if the handoff targets a git submodule inside `workdir` and retarget to it.
+
+    Returns `(effective_workdir, effective_focus_subdir, effective_verify_hint, submodule_rel)`.
+    In Git, superproject `git diff HEAD` never captures file edits inside a submodule; retargeting
+    ensures both worker diff capture and local patch application operate on the submodule repo.
+    """
+    base_top = _git_toplevel(workdir) or workdir
+    clean_focus = focus_subdir.strip().strip("/")
+
+    if clean_focus:
+        candidate = (workdir / clean_focus).resolve()
+        probe = candidate if candidate.is_dir() else candidate.parent
+        if probe.is_dir():
+            sub_top = _git_toplevel(probe)
+            if sub_top is not None and sub_top != base_top:
+                try:
+                    sub_rel = sub_top.relative_to(base_top).as_posix()
+                except ValueError:
+                    sub_rel = sub_top.name
+                try:
+                    new_focus = candidate.relative_to(sub_top).as_posix()
+                    if new_focus == ".":
+                        new_focus = ""
+                except ValueError:
+                    new_focus = ""
+                return (
+                    sub_top,
+                    new_focus,
+                    _rewrite_verify_hint_for_submodule(verify_hint, sub_rel),
+                    sub_rel,
+                )
+
+    combined_text = f"{prompt}\n{verify_hint}"
+    if combined_text.strip():
+        submodules = _list_checked_out_submodules(base_top)
+        matched = [
+            sub_rel
+            for sub_rel in submodules
+            if re.search(
+                rf"(?<![A-Za-z0-9_.-]){re.escape(sub_rel)}(?=$|[/\s,:;)'\"])",
+                combined_text,
+            )
+        ]
+        if len(matched) == 1:
+            sub_rel = matched[0]
+            sub_top = (base_top / sub_rel).resolve()
+            return (
+                sub_top,
+                "",
+                _rewrite_verify_hint_for_submodule(verify_hint, sub_rel),
+                sub_rel,
+            )
+
+    return workdir, focus_subdir, verify_hint, ""
+
+
+def create_repo_snapshot_b64(
+    workdir: Path,
+    *,
+    ref: str = "HEAD",
+    max_bytes: int | None = None,
+) -> tuple[str, int]:
+    """Pack tracked files at `ref` via `git archive --format=tar.gz` and return `(b64, raw_bytes)`."""
+    limit = (
+        max_bytes
+        if max_bytes is not None
+        else int(os.environ.get("AGY_HANDOFF_MAX_SNAPSHOT_BYTES", str(DEFAULT_MAX_SNAPSHOT_BYTES)))
+    )
+    proc = subprocess.run(
+        ["git", "-C", str(workdir), "archive", "--format=tar.gz", ref],
+        check=False,
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"`git archive --format=tar.gz {ref}` failed in `{workdir}`: {err}")
+    raw = proc.stdout
+    if limit > 0 and len(raw) > limit:
+        raise RuntimeError(
+            f"Compressed repository snapshot is {len(raw) / (1024 * 1024):.1f} MiB "
+            f"(exceeds {limit / (1024 * 1024):.1f} MiB limit). "
+            "Configure a per-owner GitHub token in k3s or set AGY_HANDOFF_MAX_SNAPSHOT_BYTES."
+        )
+    return base64.b64encode(raw).decode("ascii"), len(raw)
+
+
+def check_remote_repo_access(
+    *,
+    base_url: str,
+    repo: str,
+    token: str = "",
+    ca_cert: str = "",
+    insecure: bool = False,
+) -> tuple[bool | None, str]:
+    """Query `GET /api/handoff/repo-access?repo=...`.
+
+    Returns `(accessible, reason)` where `accessible` is `None` if the server does not
+    expose the preflight endpoint (e.g. older controller) or is momentarily unreachable.
+    """
+    if not repo or repo.startswith("local/"):
+        return False, "local-only repository"
+    url = f"{base_url}/api/handoff/repo-access?repo={urllib.parse.quote(repo)}"
+    try:
+        resp = http_json(
+            "GET",
+            url,
+            token=token,
+            ca_cert=ca_cert,
+            insecure=insecure,
+            timeout=15.0,
+        )
+        if "accessible" in resp:
+            return bool(resp["accessible"]), str(resp.get("reason") or "")
+        return None, ""
+    except urllib.error.HTTPError as exc:
+        if exc.code in {404, 405}:
+            return None, "preflight endpoint not available"
+        return None, f"HTTP {exc.code}"
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        return None, str(exc)
 
 
 def detect_git_metadata(workdir: Path) -> dict[str, str]:
@@ -146,7 +356,9 @@ def detect_git_metadata(workdir: Path) -> dict[str, str]:
     base_sha = head_sha
     diff_target = "HEAD"
 
-    refs_proc = _git("for-each-ref", "--format=%(refname:short)", "refs/remotes/origin", check=False)
+    refs_proc = _git(
+        "for-each-ref", "--format=%(refname:short)", "refs/remotes/origin", check=False
+    )
     origin_refs = [
         r.strip()
         for r in refs_proc.stdout.splitlines()
@@ -171,9 +383,7 @@ def detect_git_metadata(workdir: Path) -> dict[str, str]:
             base_branch = chosen.removeprefix("origin/")
         else:
             candidates: list[str] = []
-            up_proc = _git(
-                "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}", check=False
-            )
+            up_proc = _git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}", check=False)
             if up_proc.returncode == 0 and up_proc.stdout.strip() in origin_refs:
                 candidates.append(up_proc.stdout.strip())
             if local_branch != "HEAD" and f"origin/{local_branch}" in origin_refs:
@@ -212,9 +422,26 @@ def detect_git_metadata(workdir: Path) -> dict[str, str]:
     }
 
 
-def _state_file(workdir: Path) -> Path:
+def _resolve_git_dir(workdir: Path) -> Path:
+    """Resolve the real git metadata directory (handles submodules & worktrees where `.git` is a file)."""
+    proc = subprocess.run(
+        ["git", "-C", str(workdir), "rev-parse", "--git-dir"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode == 0 and proc.stdout.strip():
+        raw = Path(proc.stdout.strip())
+        resolved = raw if raw.is_absolute() else (workdir / raw).resolve()
+        if resolved.is_dir():
+            return resolved
     git_dir = workdir / ".git"
-    if git_dir.is_dir():
+    return git_dir if git_dir.is_dir() else workdir
+
+
+def _state_file(workdir: Path) -> Path:
+    git_dir = _resolve_git_dir(workdir)
+    if git_dir != workdir:
         return git_dir / "agy_handoff_state.json"
     return workdir / ".agy_handoff_state.json"
 
@@ -275,7 +502,7 @@ def apply_remote_patch_safely(
     if not patch_text.strip():
         return True, "Remote task produced no code diff (working tree left unchanged)."
 
-    git_dir = workdir / ".git" if (workdir / ".git").is_dir() else workdir
+    git_dir = _resolve_git_dir(workdir)
     backup_patch_path = git_dir / "agy_handoff_pre_pull_backup.patch"
     remote_patch_path = git_dir / "agy_handoff_latest.patch"
     remote_patch_path.write_text(patch_text, encoding="utf-8")
@@ -326,20 +553,39 @@ def apply_remote_patch_safely(
                 if add_wt.returncode == 0:
                     try:
                         ap = subprocess.run(
-                            ["git", "-C", str(wt_dir), "apply", "--whitespace=nowarn", str(remote_patch_path)],
+                            [
+                                "git",
+                                "-C",
+                                str(wt_dir),
+                                "apply",
+                                "--whitespace=nowarn",
+                                str(remote_patch_path),
+                            ],
                             check=False,
                             capture_output=True,
                             text=True,
                         )
                         if ap.returncode != 0:
                             ap = subprocess.run(
-                                ["git", "-C", str(wt_dir), "apply", "--3way", "--whitespace=nowarn", str(remote_patch_path)],
+                                [
+                                    "git",
+                                    "-C",
+                                    str(wt_dir),
+                                    "apply",
+                                    "--3way",
+                                    "--whitespace=nowarn",
+                                    str(remote_patch_path),
+                                ],
                                 check=False,
                                 capture_output=True,
                                 text=True,
                             )
                         if ap.returncode == 0:
-                            subprocess.run(["git", "-C", str(wt_dir), "add", "-A"], check=False, capture_output=True)
+                            subprocess.run(
+                                ["git", "-C", str(wt_dir), "add", "-A"],
+                                check=False,
+                                capture_output=True,
+                            )
                             tree = subprocess.run(
                                 ["git", "-C", str(wt_dir), "write-tree"],
                                 check=False,
@@ -354,22 +600,51 @@ def apply_remote_patch_safely(
                                     text=True,
                                 ).stdout
                                 if not rebased.strip():
-                                    return True, f"Working tree already matches remote pod state at `{current_sha[:8]}`."
+                                    return (
+                                        True,
+                                        f"Working tree already matches remote pod state at `{current_sha[:8]}`.",
+                                    )
                                 rebased_path = git_dir / "agy_handoff_rebased.patch"
                                 rebased_path.write_text(rebased, encoding="utf-8")
-                                subprocess.run(["git", "-C", str(workdir), "reset", "--hard", "HEAD"], check=False, capture_output=True)
-                                subprocess.run(["git", "-C", str(workdir), "clean", "-fd"], check=False, capture_output=True)
+                                subprocess.run(
+                                    ["git", "-C", str(workdir), "reset", "--hard", "HEAD"],
+                                    check=False,
+                                    capture_output=True,
+                                )
+                                subprocess.run(
+                                    ["git", "-C", str(workdir), "clean", "-fd"],
+                                    check=False,
+                                    capture_output=True,
+                                )
                                 apply_rebased = subprocess.run(
-                                    ["git", "-C", str(workdir), "apply", "--whitespace=nowarn", str(rebased_path)],
+                                    [
+                                        "git",
+                                        "-C",
+                                        str(workdir),
+                                        "apply",
+                                        "--whitespace=nowarn",
+                                        str(rebased_path),
+                                    ],
                                     check=False,
                                     capture_output=True,
                                     text=True,
                                 )
                                 if apply_rebased.returncode == 0:
-                                    return True, f"Rebased & applied remote delta onto unpushed HEAD `{current_sha[:8]}` (backup at `{backup_patch_path}`)."
+                                    return (
+                                        True,
+                                        f"Rebased & applied remote delta onto unpushed HEAD `{current_sha[:8]}` (backup at `{backup_patch_path}`).",
+                                    )
                     finally:
                         subprocess.run(
-                            ["git", "-C", str(workdir), "worktree", "remove", "--force", str(wt_dir)],
+                            [
+                                "git",
+                                "-C",
+                                str(workdir),
+                                "worktree",
+                                "remove",
+                                "--force",
+                                str(wt_dir),
+                            ],
                             check=False,
                             capture_output=True,
                         )
@@ -426,6 +701,11 @@ def apply_remote_patch_safely(
     )
 
 
+def _local_repo_slug(workdir: Path) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", workdir.name).strip("-.") or "workspace"
+    return f"local/{slug}"
+
+
 def push_handoff(
     workdir: Path,
     *,
@@ -440,53 +720,140 @@ def push_handoff(
     focus_subdir: str = "",
     model: str = "gemini-4-hydrogen",
     local_conversation_id: str = "",
+    upload_repo: bool | None = None,
 ) -> dict[str, Any]:
-    git_meta = detect_git_metadata(workdir)
-    repo = github_repo.strip() or git_meta["github_repo"]
-    if not repo:
-        raise ValueError(
-            "Could not detect GitHub repository from `git remote get-url origin`. Pass `--repo owner/name`."
+    orig_workdir = workdir.resolve()
+    effective_workdir, effective_focus, effective_verify_hint, submodule_rel = (
+        resolve_effective_workdir(
+            orig_workdir,
+            focus_subdir=focus_subdir,
+            prompt=prompt,
+            verify_hint=verify_hint,
+        )
+    )
+    effective_semantic_state = semantic_state
+    if submodule_rel and effective_workdir != orig_workdir:
+        sub_note = (
+            f"Note: Handoff was automatically retargeted to git submodule `{submodule_rel}`. "
+            f"`/work` IS the root of `{submodule_rel}` (any `{submodule_rel}/...` paths mentioned "
+            "in instructions correspond to paths relative to `/work`)."
+        )
+        effective_semantic_state = (
+            f"{sub_note}\n\n{semantic_state}".strip() if semantic_state.strip() else sub_note
+        )
+        print(
+            f"[agy-handoff] Detected git submodule target `{submodule_rel}` — "
+            f"retargeting handoff to `{effective_workdir}` so diff capture & local patch apply work cleanly.",
+            flush=True,
         )
 
-    patch_text = git_meta["patch"]
+    git_meta = detect_git_metadata(effective_workdir)
+    repo = github_repo.strip() or git_meta["github_repo"]
     max_patch_bytes = int(
         os.environ.get("AGY_HANDOFF_MAX_PATCH_BYTES", str(DEFAULT_MAX_INLINE_PATCH_BYTES))
     )
+
+    should_upload_snapshot = False
+    if upload_repo is True:
+        should_upload_snapshot = True
+        if not repo:
+            repo = _local_repo_slug(effective_workdir)
+    elif upload_repo is False:
+        if not repo:
+            raise ValueError(
+                "Could not detect GitHub repository from `git remote get-url origin`. "
+                "Pass `--repo owner/name` or omit `--no-upload-repo` to upload a snapshot."
+            )
+    else:
+        if not repo:
+            repo = _local_repo_slug(effective_workdir)
+            should_upload_snapshot = True
+            print(
+                f"[agy-handoff] No GitHub remote detected for `{effective_workdir}` — "
+                f"uploading compressed HEAD snapshot as `{repo}`.",
+                flush=True,
+            )
+        else:
+            accessible, reason = check_remote_repo_access(
+                base_url=base_url,
+                repo=repo,
+                token=token,
+                ca_cert=ca_cert,
+                insecure=insecure,
+            )
+            if accessible is False:
+                should_upload_snapshot = True
+                reason_suffix = f" ({reason})" if reason else ""
+                print(
+                    f"[agy-handoff] Cluster cannot mirror `{repo}`{reason_suffix} — "
+                    "uploading compressed HEAD snapshot on-the-fly...",
+                    flush=True,
+                )
+
+    base_branch = git_meta["base_branch"]
+    base_sha = git_meta["base_sha"]
+    patch_text = git_meta["patch"]
+    repo_snapshot_b64 = ""
+
+    if should_upload_snapshot:
+        local_branch = git_meta.get("local_branch") or base_branch
+        base_branch = local_branch if local_branch != "HEAD" else "main"
+        base_sha = git_meta.get("head_sha") or base_sha
+        subprocess.run(
+            ["git", "-C", str(effective_workdir), "add", "-N", "."],
+            check=False,
+            capture_output=True,
+        )
+        patch_text = subprocess.run(
+            ["git", "-C", str(effective_workdir), "diff", "--binary", "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+        ).stdout
+        repo_snapshot_b64, snap_bytes = create_repo_snapshot_b64(effective_workdir, ref="HEAD")
+        print(
+            f"[agy-handoff] Packed HEAD snapshot for `{repo}` ({snap_bytes / 1024:.1f} KiB compressed).",
+            flush=True,
+        )
+
     patch_bytes = len(patch_text.encode("utf-8"))
     if max_patch_bytes > 0 and patch_bytes > max_patch_bytes:
         patch_mb = patch_bytes / (1024 * 1024)
         limit_mb = max_patch_bytes / (1024 * 1024)
-        local_branch = git_meta.get("local_branch") or git_meta["base_branch"]
+        local_branch = git_meta.get("local_branch") or base_branch
         head_sha = git_meta.get("head_sha") or ""
-        if head_sha and head_sha != git_meta["base_sha"] and local_branch != "HEAD":
+        if head_sha and head_sha != base_sha and local_branch != "HEAD":
             raise RuntimeError(
                 f"Inline handoff patch is {patch_mb:.1f} MiB (exceeds {limit_mb:.1f} MiB limit) "
                 f"because local branch `{local_branch}` ({head_sha[:8]}) has unpushed commits "
-                f"diverged from `{git_meta['base_branch']}` ({git_meta['base_sha'][:8]}). "
-                f"Run `git push -u origin {local_branch}` first, then retry `/handoff`."
+                f"diverged from `{base_branch}` ({base_sha[:8]}). "
+                f"Run `git push -u origin {local_branch}` first, or pass `--upload-repo`."
             )
         raise RuntimeError(
             f"Inline handoff patch is {patch_mb:.1f} MiB (exceeds {limit_mb:.1f} MiB limit). "
             "Commit & push large/binary changes or set AGY_HANDOFF_MAX_PATCH_BYTES to override."
         )
 
-    payload = {
+    payload: dict[str, Any] = {
         "repo": repo,
         "github_repo": repo,
-        "branch": git_meta["base_branch"],
-        "base_branch": git_meta["base_branch"],
-        "base_sha": git_meta["base_sha"],
+        "branch": base_branch,
+        "base_branch": base_branch,
+        "base_sha": base_sha,
         "base_patch": patch_text,
         "patch": patch_text,
         "prompt": prompt,
-        "semantic_state": semantic_state,
-        "verify_hint": verify_hint,
-        "focus_subdir": focus_subdir,
+        "semantic_state": effective_semantic_state,
+        "verify_hint": effective_verify_hint,
+        "focus_subdir": effective_focus,
         "model": model,
         "source_conversation_id": local_conversation_id or "",
         "local_conversation_id": local_conversation_id or None,
-        "workspace_path": str(workdir),
+        "workspace_path": str(effective_workdir),
     }
+    if repo_snapshot_b64:
+        payload["repo_snapshot_b64"] = repo_snapshot_b64
+
     resp = http_json(
         "POST",
         f"{base_url}/api/handoff",
@@ -494,22 +861,26 @@ def push_handoff(
         payload=payload,
         ca_cert=ca_cert,
         insecure=insecure,
+        timeout=60.0 if repo_snapshot_b64 else 20.0,
     )
     resolved_id = resp.get("handoff_id") or resp.get("issue_id") or resp.get("short_id")
     if resolved_id and not resp.get("handoff_id"):
         resp["handoff_id"] = resolved_id
-    save_local_handoff_state(
-        workdir,
-        {
-            "handoff_id": resolved_id,
-            "short_id": resp.get("short_id"),
-            "github_repo": repo,
-            "base_sha": git_meta["base_sha"],
-            "base_url": base_url,
-            "pushed_at": time.time(),
-            "pulled": False,
-        },
-    )
+    resp["effective_workdir"] = str(effective_workdir)
+
+    state_payload = {
+        "handoff_id": resolved_id,
+        "short_id": resp.get("short_id"),
+        "github_repo": repo,
+        "base_sha": base_sha,
+        "base_url": base_url,
+        "target_workdir": str(effective_workdir),
+        "pushed_at": time.time(),
+        "pulled": False,
+    }
+    save_local_handoff_state(effective_workdir, state_payload)
+    if effective_workdir != orig_workdir:
+        save_local_handoff_state(orig_workdir, state_payload)
     return resp
 
 
@@ -686,6 +1057,16 @@ def main(argv: list[str] | None = None) -> int:
     p_start.add_argument(
         "--no-apply", action="store_true", help="Do not auto-apply patch on completion"
     )
+    p_start.add_argument(
+        "--upload-repo",
+        action="store_true",
+        help="Upload a compressed HEAD snapshot of the repository on-the-fly (no k3s GitHub creds required)",
+    )
+    p_start.add_argument(
+        "--no-upload-repo",
+        action="store_true",
+        help="Disable automatic repository snapshot upload fallback",
+    )
 
     # `push`: Fire-and-forget push without polling
     p_push = sub.add_parser(
@@ -707,6 +1088,16 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         choices=("", "low", "medium", "high"),
         help="Optional effort tier (low, medium, high) combined with --model",
+    )
+    p_push.add_argument(
+        "--upload-repo",
+        action="store_true",
+        help="Upload a compressed HEAD snapshot of the repository on-the-fly (no k3s GitHub creds required)",
+    )
+    p_push.add_argument(
+        "--no-upload-repo",
+        action="store_true",
+        help="Disable automatic repository snapshot upload fallback",
     )
 
     # `watch`: Poll an existing handoff on wake
@@ -744,6 +1135,21 @@ def main(argv: list[str] | None = None) -> int:
     ca_cert = getattr(args, "ca_cert", "") or env_ca
     insecure = bool(getattr(args, "insecure", False))
 
+    def _resolve_upload_repo_flag() -> bool | None:
+        if getattr(args, "upload_repo", False):
+            return True
+        if getattr(args, "no_upload_repo", False):
+            return False
+        return None
+
+    def _resolve_saved_target_workdir(base_dir: Path, saved: dict[str, Any] | None) -> Path:
+        raw_target = str((saved or {}).get("target_workdir") or "").strip()
+        if raw_target:
+            candidate = Path(raw_target)
+            if candidate.is_dir():
+                return candidate
+        return base_dir
+
     if cmd == "push":
         created = push_handoff(
             workdir,
@@ -757,12 +1163,14 @@ def main(argv: list[str] | None = None) -> int:
             verify_hint=args.verify_hint,
             focus_subdir=args.focus_subdir,
             model=normalize_model_with_effort(args.model, args.effort) or "gemini-4-hydrogen",
+            upload_repo=_resolve_upload_repo_flag(),
         )
         print(json.dumps(created, indent=2) if args.json else _format_summary(created))
         return 0
 
     if cmd == "start":
         handoff_id = args.handoff_id.strip()
+        poll_workdir = workdir
         if not handoff_id and args.prompt.strip():
             created = push_handoff(
                 workdir,
@@ -776,15 +1184,23 @@ def main(argv: list[str] | None = None) -> int:
                 verify_hint=args.verify_hint,
                 focus_subdir=args.focus_subdir,
                 model=normalize_model_with_effort(args.model, args.effort) or "gemini-4-hydrogen",
+                upload_repo=_resolve_upload_repo_flag(),
             )
             handoff_id = str(
-                created.get("handoff_id") or created.get("issue_id") or created.get("short_id") or ""
+                created.get("handoff_id")
+                or created.get("issue_id")
+                or created.get("short_id")
+                or ""
             )
+            eff = str(created.get("effective_workdir") or "").strip()
+            if eff and Path(eff).is_dir():
+                poll_workdir = Path(eff)
             print(_format_summary(created), flush=True)
         elif not handoff_id:
             local_state = load_local_handoff_state(workdir)
             if local_state and local_state.get("handoff_id") and not local_state.get("pulled"):
                 handoff_id = str(local_state["handoff_id"])
+                poll_workdir = _resolve_saved_target_workdir(workdir, local_state)
             else:
                 latest = http_json(
                     "GET",
@@ -794,11 +1210,14 @@ def main(argv: list[str] | None = None) -> int:
                     insecure=insecure,
                 )
                 handoff_id = str(
-                    latest.get("handoff_id") or latest.get("issue_id") or latest.get("short_id") or "latest"
+                    latest.get("handoff_id")
+                    or latest.get("issue_id")
+                    or latest.get("short_id")
+                    or "latest"
                 )
 
         result = poll_until_ready_and_pull(
-            workdir,
+            poll_workdir,
             base_url=base_url,
             token=token,
             ca_cert=ca_cert,
@@ -812,11 +1231,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if cmd == "watch":
         handoff_id = args.handoff_id.strip()
+        local_state = load_local_handoff_state(workdir)
+        watch_workdir = workdir
         if not handoff_id:
-            local_state = load_local_handoff_state(workdir)
             handoff_id = str((local_state or {}).get("handoff_id") or "latest")
+            watch_workdir = _resolve_saved_target_workdir(workdir, local_state)
+        elif local_state and local_state.get("handoff_id") == handoff_id:
+            watch_workdir = _resolve_saved_target_workdir(workdir, local_state)
         result = poll_until_ready_and_pull(
-            workdir,
+            watch_workdir,
             base_url=base_url,
             token=token,
             ca_cert=ca_cert,
@@ -830,9 +1253,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if cmd in {"pull", "status"}:
         handoff_id = args.handoff_id.strip()
+        local_state = load_local_handoff_state(workdir)
+        pull_workdir = workdir
         if not handoff_id:
-            local_state = load_local_handoff_state(workdir)
             handoff_id = str((local_state or {}).get("handoff_id") or "latest")
+            pull_workdir = _resolve_saved_target_workdir(workdir, local_state)
+        elif local_state and local_state.get("handoff_id") == handoff_id:
+            pull_workdir = _resolve_saved_target_workdir(workdir, local_state)
         include_patch = "true" if cmd == "pull" else "false"
         endpoint = (
             f"{base_url}/api/handoff/latest?include_patch={include_patch}"
@@ -848,13 +1275,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         if cmd == "pull" and not getattr(args, "no_apply", False):
             ok, msg = apply_remote_patch_safely(
-                workdir,
+                pull_workdir,
                 patch_text=str(data.get("patch") or data.get("diff") or ""),
                 expected_base_sha=str(data.get("base_sha") or ""),
             )
             data["applied_ok"] = ok
             data["apply_message"] = msg
-            resolved_pull_id = data.get("handoff_id") or data.get("issue_id") or data.get("short_id")
+            resolved_pull_id = (
+                data.get("handoff_id") or data.get("issue_id") or data.get("short_id")
+            )
             if ok and resolved_pull_id:
                 try:
                     http_json(

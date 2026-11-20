@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 from collections.abc import Mapping
@@ -382,6 +383,42 @@ def _normalize_base_path(raw: str) -> str:
     return clean
 
 
+def parse_github_tokens_from_env(env: Mapping[str, str]) -> dict[str, str]:
+    """Parse per-owner and per-repo GitHub tokens from `GITHUB_TOKENS_JSON` and `GITHUB_TOKEN_<OWNER>`.
+
+    Keys are normalized to lowercase (`"owner"` or `"owner/repo"`). For `GITHUB_TOKEN_<OWNER>`,
+    underscores in `<OWNER>` register both the raw underscore form and hyphenated form (e.g.
+    `GITHUB_TOKEN_LODBROK_APP` matches `lodbrok-app`). Explicit entries in `GITHUB_TOKENS_JSON`
+    take precedence over env-var suffix tokens.
+    """
+    tokens: dict[str, str] = {}
+    for key, raw_val in env.items():
+        if not key.startswith("GITHUB_TOKEN_"):
+            continue
+        suffix = key[len("GITHUB_TOKEN_") :].strip()
+        val = (raw_val or "").strip()
+        if not suffix or not val or suffix.upper() in {"FILE", "JSON"}:
+            continue
+        owner_lower = suffix.lower()
+        tokens[owner_lower] = val
+        if "_" in owner_lower:
+            tokens[owner_lower.replace("_", "-")] = val
+
+    raw_json = (env.get("GITHUB_TOKENS_JSON") or "").strip()
+    if raw_json:
+        parsed = json.loads(raw_json)
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                "GITHUB_TOKENS_JSON must be a JSON object mapping owner or owner/repo to token."
+            )
+        for raw_k, raw_v in parsed.items():
+            k = str(raw_k or "").strip().lower()
+            v = str(raw_v or "").strip()
+            if k and v:
+                tokens[k] = v
+    return tokens
+
+
 class ControllerSettings(pydantic.BaseModel):
     namespace: str = "agent-tasks"
     node_name: str | None = None
@@ -400,6 +437,7 @@ class ControllerSettings(pydantic.BaseModel):
 
     sentry_auth_token: str = ""
     target_github_token: str
+    github_tokens: dict[str, str] = pydantic.Field(default_factory=dict)
     slack_enabled: bool = True
     slack_bot_token: str = ""
     slack_app_token: str = ""
@@ -418,6 +456,19 @@ class ControllerSettings(pydantic.BaseModel):
     vapid_private_key: str = ""
     garmin_api_key: str = ""
 
+    def resolve_github_token(self, github_repo: str) -> str:
+        """Resolve the best GitHub token for `owner/repo` (exact repo -> owner -> default)."""
+        clean = (github_repo or "").strip().lower().removesuffix(".git")
+        if clean:
+            exact = self.github_tokens.get(clean)
+            if exact:
+                return exact
+            owner = clean.split("/", 1)[0]
+            by_owner = self.github_tokens.get(owner)
+            if by_owner:
+                return by_owner
+        return self.target_github_token
+
     @classmethod
     def from_env(cls) -> ControllerSettings:
         slack_enabled = _parse_bool(os.environ.get("SLACK_ENABLED"), True)
@@ -429,6 +480,13 @@ class ControllerSettings(pydantic.BaseModel):
             slack_bot_token = os.environ.get("SLACK_BOT_TOKEN", "")
             slack_app_token = os.environ.get("SLACK_APP_TOKEN", "")
             slack_channel_id = os.environ.get("SLACK_CHANNEL_ID", "")
+
+        github_tokens = parse_github_tokens_from_env(os.environ)
+        target_github_token = (
+            os.environ.get("TARGET_GITHUB_TOKEN", "")
+            if github_tokens
+            else os.environ["TARGET_GITHUB_TOKEN"]
+        )
 
         return cls(
             namespace=os.environ.get("NAMESPACE", "agent-tasks"),
@@ -451,7 +509,8 @@ class ControllerSettings(pydantic.BaseModel):
             ),
             max_concurrent_jobs=int(os.environ.get("MAX_CONCURRENT_JOBS", "2")),
             sentry_auth_token=os.environ.get("SENTRY_AUTH_TOKEN", ""),
-            target_github_token=os.environ["TARGET_GITHUB_TOKEN"],
+            target_github_token=target_github_token,
+            github_tokens=github_tokens,
             slack_enabled=slack_enabled,
             slack_bot_token=slack_bot_token,
             slack_app_token=slack_app_token,

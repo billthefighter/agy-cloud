@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
+import io
 import os
 import re
 import shutil
 import subprocess
+import tarfile
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import httpx
 import structlog
@@ -159,6 +162,146 @@ async def sync_agy_config_repo(
     )
 
 
+DEFAULT_MAX_REPO_SNAPSHOT_BYTES = 25 * 1024 * 1024  # 25 MiB compressed
+_GITHUB_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+class RepoSnapshotTooLargeError(ValueError):
+    """Raised when an uploaded repository snapshot exceeds the configured size limit."""
+
+
+def validate_and_write_repo_snapshot(
+    snapshot_b64: str,
+    dest_path: Path,
+    *,
+    max_bytes: int = DEFAULT_MAX_REPO_SNAPSHOT_BYTES,
+) -> int:
+    """Decode, validate, and persist a base64-encoded `git archive --format=tar.gz` snapshot."""
+    cleaned = "".join(snapshot_b64.split())
+    if not cleaned:
+        raise ValueError("Repository snapshot payload is empty.")
+    # Fast upper-bound check before allocating full decoded bytes
+    if max_bytes > 0 and (len(cleaned) * 3) // 4 > max_bytes + 64:
+        raise RepoSnapshotTooLargeError(
+            f"Repository snapshot exceeds the {max_bytes / (1024 * 1024):.1f} MiB compressed limit."
+        )
+    try:
+        raw = base64.b64decode(cleaned, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"Invalid base64 repository snapshot: {exc}") from exc
+
+    if not raw:
+        raise ValueError("Decoded repository snapshot is empty.")
+    if max_bytes > 0 and len(raw) > max_bytes:
+        raise RepoSnapshotTooLargeError(
+            f"Repository snapshot is {len(raw) / (1024 * 1024):.1f} MiB, "
+            f"exceeding the {max_bytes / (1024 * 1024):.1f} MiB limit."
+        )
+
+    try:
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tf:
+            for member in tf.getmembers():
+                posix = PurePosixPath(member.name)
+                if posix.is_absolute() or ".." in posix.parts:
+                    raise ValueError(f"Unsafe path in repository snapshot: `{member.name}`")
+                if member.isdev() or member.isfifo():
+                    raise ValueError(
+                        f"Unsupported special file in repository snapshot: `{member.name}`"
+                    )
+                if member.issym() or member.islnk():
+                    target_posix = PurePosixPath(member.linkname)
+                    if target_posix.is_absolute():
+                        raise ValueError(
+                            f"Absolute link target in repository snapshot: `{member.name}` -> `{member.linkname}`"
+                        )
+                    resolved = os.path.normpath(
+                        str(posix.parent / target_posix) if member.issym() else str(target_posix)
+                    )
+                    if resolved == ".." or resolved.startswith("../") or resolved.startswith("/"):
+                        raise ValueError(
+                            f"Escaping link target in repository snapshot: `{member.name}` -> `{member.linkname}`"
+                        )
+    except (tarfile.TarError, EOFError, OSError) as exc:
+        raise ValueError(f"Invalid gzipped tar repository snapshot: {exc}") from exc
+
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    dest_path.write_bytes(raw)
+    return len(raw)
+
+
+def check_github_repo_access_sync(
+    mirrors_root: Path,
+    github_repo: str,
+    github_token: str,
+    *,
+    timeout_seconds: float = 10.0,
+) -> tuple[bool, bool, str]:
+    """Check whether the controller can fetch `github_repo` via `git ls-remote`.
+
+    Returns `(accessible, has_mirror, reason)`. Never prompts interactively.
+    """
+    clean_repo = (github_repo or "").strip().removesuffix(".git")
+    mirror_path = mirror_dir_for_repo(mirrors_root, clean_repo) if clean_repo else mirrors_root
+    has_mirror = bool(clean_repo) and (mirror_path / "HEAD").exists()
+
+    if (
+        not clean_repo
+        or clean_repo.startswith("local/")
+        or not _GITHUB_SLUG_RE.fullmatch(clean_repo)
+    ):
+        return False, False, "local-only or non-GitHub repository slug"
+
+    clean_url = f"https://github.com/{clean_repo}.git"
+    cmd = ["git"]
+    if github_token.strip():
+        cmd.extend(
+            [
+                "-c",
+                f"http.https://github.com/.extraheader={_github_basic_auth_header(github_token.strip())}",
+            ]
+        )
+    cmd.extend(["ls-remote", "--exit-code", clean_url, "HEAD"])
+
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        proc = subprocess.run(
+            cmd,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return False, has_mirror, f"git ls-remote timed out after {int(timeout_seconds)}s"
+    except OSError as exc:
+        return False, has_mirror, str(exc)
+
+    if proc.returncode == 0:
+        return True, has_mirror, "ok"
+    stderr = (proc.stderr or proc.stdout or "").strip()
+    first_line = (
+        stderr.splitlines()[0] if stderr else f"git ls-remote exited with code {proc.returncode}"
+    )
+    return False, has_mirror, first_line[:240]
+
+
+async def check_github_repo_access(
+    mirrors_root: Path,
+    github_repo: str,
+    github_token: str,
+    *,
+    timeout_seconds: float = 10.0,
+) -> tuple[bool, bool, str]:
+    return await asyncio.to_thread(
+        check_github_repo_access_sync,
+        mirrors_root,
+        github_repo,
+        github_token,
+        timeout_seconds=timeout_seconds,
+    )
+
+
 def mirror_dir_for_repo(mirrors_root: Path, github_repo: str) -> Path:
     safe_slug = github_repo.replace("/", "__")
     return mirrors_root / f"{safe_slug}.git"
@@ -175,20 +318,28 @@ def sync_bare_mirror_sync(mirrors_root: Path, github_repo: str, github_token: st
     mirrors_root.mkdir(parents=True, exist_ok=True)
     mirror_path = mirror_dir_for_repo(mirrors_root, github_repo)
     clean_url = f"https://github.com/{github_repo}.git"
-    auth_header = _github_basic_auth_header(github_token)
+    auth_args = (
+        [
+            "-c",
+            f"http.https://github.com/.extraheader={_github_basic_auth_header(github_token.strip())}",
+        ]
+        if github_token.strip()
+        else []
+    )
+    git_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
 
     if not (mirror_path / "HEAD").exists():
         log.info("git_mirror.cloning", repo=github_repo, path=str(mirror_path))
         subprocess.run(
             [
                 "git",
-                "-c",
-                f"http.https://github.com/.extraheader={auth_header}",
+                *auth_args,
                 "clone",
                 "--mirror",
                 clean_url,
                 str(mirror_path),
             ],
+            env=git_env,
             check=True,
             capture_output=True,
             text=True,
@@ -197,6 +348,7 @@ def sync_bare_mirror_sync(mirrors_root: Path, github_repo: str, github_token: st
         # Ensure origin URL never holds embedded credentials, then fetch latest refs.
         subprocess.run(
             ["git", "-C", str(mirror_path), "remote", "set-url", "origin", clean_url],
+            env=git_env,
             check=True,
             capture_output=True,
             text=True,
@@ -206,12 +358,12 @@ def sync_bare_mirror_sync(mirrors_root: Path, github_repo: str, github_token: st
                 "git",
                 "-C",
                 str(mirror_path),
-                "-c",
-                f"http.https://github.com/.extraheader={auth_header}",
+                *auth_args,
                 "remote",
                 "update",
                 "--prune",
             ],
+            env=git_env,
             check=True,
             capture_output=True,
             text=True,

@@ -24,6 +24,7 @@ def build_triage_job_manifest(
     record: IssueRecord,
     target: ProjectTargetConfig,
     worker_backend: str = "sdk",
+    use_repo_snapshot: bool = False,
 ) -> client.V1Job:
     """Build a locked-down Kubernetes batch/v1 Job for isolated AGY triage on makesense.
 
@@ -32,7 +33,8 @@ def build_triage_job_manifest(
     2. Worker container receives ONLY `agent-tasks-worker-secret` (GEMINI_API_KEY) —
        never GitHub, Slack, or Sentry tokens.
     3. Mounts only subPaths of `agent-tasks-state` (`mirrors/<repo>.git` read-only in
-       initContainer, plus `sessions/<id>`, `artifacts/<id>`, and `caches/`).
+       initContainer when not using an uploaded repo snapshot, plus `sessions/<id>`,
+       `artifacts/<id>`, and `caches/`).
     4. Co-locates onto the controller's node (`MY_NODE_NAME` + `podAffinity`) so
        makesense's 3-worker `local-path` ReadWriteOnce PVC mounts cleanly every time.
     """
@@ -43,16 +45,28 @@ def build_triage_job_manifest(
 
     init_script = (
         "set -euo pipefail\n"
-        'git clone --branch "$CLONE_REF" --single-branch /mirror /work\n'
-        "cd /work\n"
+        "if [ -s /artifacts/repo_snapshot.tar.gz ]; then\n"
+        '  echo "Initializing /work from uploaded repo_snapshot.tar.gz..."\n'
+        "  mkdir -p /work\n"
+        "  tar -xzf /artifacts/repo_snapshot.tar.gz -C /work\n"
+        "  cd /work\n"
+        '  git init -b "$CLONE_REF" >/dev/null 2>&1 || git init >/dev/null 2>&1\n'
+        '  git config user.name "agy-handoff"\n'
+        '  git config user.email "agy-handoff@local"\n'
+        "  git add -A\n"
+        '  git commit --allow-empty -q -m "handoff snapshot base"\n'
+        "else\n"
+        '  git clone --branch "$CLONE_REF" --single-branch /mirror /work\n'
+        "  cd /work\n"
         # Detach origin from /mirror so `git remote` inside /work doesn't point outside
-        "git remote remove origin || true\n"
-        "if [ -s /artifacts/base_sha.txt ]; then\n"
-        "  BASE_SHA=\"$(tr -d '[:space:]' < /artifacts/base_sha.txt)\"\n"
-        '  if [ -n "$BASE_SHA" ]; then\n'
-        '    if ! git checkout "$BASE_SHA" 2>/dev/null; then\n'
-        '      echo "ERROR: BASE_SHA $BASE_SHA not found in /mirror (branch $CLONE_REF). Push your base branch or re-run handoff." >&2\n'
-        "      exit 1\n"
+        "  git remote remove origin || true\n"
+        "  if [ -s /artifacts/base_sha.txt ]; then\n"
+        "    BASE_SHA=\"$(tr -d '[:space:]' < /artifacts/base_sha.txt)\"\n"
+        '    if [ -n "$BASE_SHA" ]; then\n'
+        '      if ! git checkout "$BASE_SHA" 2>/dev/null; then\n'
+        '        echo "ERROR: BASE_SHA $BASE_SHA not found in /mirror (branch $CLONE_REF). Push your base branch or re-run handoff." >&2\n'
+        "        exit 1\n"
+        "      fi\n"
         "    fi\n"
         "  fi\n"
         "fi\n"
@@ -71,6 +85,26 @@ def build_triage_job_manifest(
         client.V1EnvVar(name="GIT_CONFIG_VALUE_0", value="*"),
     ]
 
+    init_volume_mounts = [
+        client.V1VolumeMount(name="work", mount_path="/work"),
+        client.V1VolumeMount(
+            name="state",
+            mount_path="/artifacts",
+            sub_path=artifact_subpath,
+            read_only=True,
+        ),
+    ]
+    if not use_repo_snapshot:
+        init_volume_mounts.insert(
+            1,
+            client.V1VolumeMount(
+                name="state",
+                mount_path="/mirror",
+                sub_path=mirror_subpath,
+                read_only=True,
+            ),
+        )
+
     init_container = client.V1Container(
         name="git-clone",
         image=settings.worker_image,
@@ -86,21 +120,7 @@ def build_triage_job_manifest(
             allow_privilege_escalation=False,
             capabilities=client.V1Capabilities(drop=["ALL"]),
         ),
-        volume_mounts=[
-            client.V1VolumeMount(name="work", mount_path="/work"),
-            client.V1VolumeMount(
-                name="state",
-                mount_path="/mirror",
-                sub_path=mirror_subpath,
-                read_only=True,
-            ),
-            client.V1VolumeMount(
-                name="state",
-                mount_path="/artifacts",
-                sub_path=artifact_subpath,
-                read_only=True,
-            ),
-        ],
+        volume_mounts=init_volume_mounts,
     )
 
     use_agy_cli = worker_backend == "agy_cli"
@@ -278,12 +298,14 @@ class K8sJobRunner:
         target: ProjectTargetConfig,
         *,
         worker_backend: str = "sdk",
+        use_repo_snapshot: bool = False,
     ) -> str:
         manifest = build_triage_job_manifest(
             settings=self.settings,
             record=record,
             target=target,
             worker_backend=worker_backend,
+            use_repo_snapshot=use_repo_snapshot,
         )
         job_name = manifest.metadata.name
 
@@ -305,6 +327,7 @@ class K8sJobRunner:
             issue_id=record.issue_id,
             turn=record.turn,
             worker_backend=worker_backend,
+            use_repo_snapshot=use_repo_snapshot,
         )
         return job_name
 

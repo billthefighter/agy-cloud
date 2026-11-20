@@ -588,6 +588,20 @@ def test_async_mode_food_log_enqueues_immediately_and_tracks_pending(tmp_path: P
         assert len(today["meals"]) == 1
         assert today["pending_logs"] == []
 
+        entry_id = today["meals"][0]["id"]
+        again_resp = client.post(
+            f"/agy/api/food/entries/{entry_id}/log-again",
+            headers={"X-AGY-Client": "pwa"},
+            json={"logged_at": "2026-11-20T12:30:00-08:00"},
+        )
+        assert again_resp.status_code == 200
+        again_data = again_resp.json()
+        assert again_data["local_date"] == "2026-11-20"
+        assert len(again_data["meals"]) == 1
+        assert again_data["meals"][0]["id"] != entry_id
+        assert again_data["meals"][0]["model_used"] == "log-again"
+        assert again_data["meals"][0]["logged_at"] == "2026-11-20T20:30:00+00:00"
+
 
 def test_estimator_falls_back_on_timeout_and_503(monkeypatch) -> None:
     import asyncio
@@ -616,7 +630,9 @@ def test_estimator_falls_back_on_timeout_and_503(monkeypatch) -> None:
         if model == "gemini-4-hydrogen":
             await asyncio.sleep(0.5)  # Simulates 15m SDK retry stall -> hits timeout
         if model == "gemini-3.8-flash":
-            raise RuntimeError("Error 503, Message: This model is currently experiencing high demand.")
+            raise RuntimeError(
+                "Error 503, Message: This model is currently experiencing high demand."
+            )
         return (
             MealEstimateSchema(
                 title="Costco Grain & Celery Salad",
@@ -1339,9 +1355,7 @@ def test_handoff_accepts_portable_client_schema_and_mark_pulled(tmp_path: Path) 
         assert "+b = 2" in (art_dir / "initial.patch").read_text(encoding="utf-8")
         assert "9/15 cleared" in (art_dir / "task_prompt.md").read_text(encoding="utf-8")
 
-        fetched = client.get(
-            f"/agy/api/handoff/{issue_id}?include_patch=true", headers=headers
-        )
+        fetched = client.get(f"/agy/api/handoff/{issue_id}?include_patch=true", headers=headers)
         assert fetched.status_code == 200
         fetched_json = fetched.json()
         assert "+b = 2" in fetched_json["patch"]

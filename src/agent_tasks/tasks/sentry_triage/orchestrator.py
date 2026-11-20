@@ -221,7 +221,7 @@ class SentryTriageTask:
                 record=record,
                 report=report,
                 patch_path=patch_path,
-                github_token=self.settings.target_github_token,
+                github_token=self.settings.resolve_github_token(record.github_repo),
             )
             self.state.cancel_timers_for_issue(issue_id)
             self.state.mark_status(
@@ -273,7 +273,7 @@ class SentryTriageTask:
                 report=report,
                 patch_path=patch_path,
                 branch_name=record.target_branch,
-                github_token=self.settings.target_github_token,
+                github_token=self.settings.resolve_github_token(record.github_repo),
             )
             self.state.cancel_timers_for_issue(issue_id)
             self.state.mark_status(
@@ -886,21 +886,25 @@ class SentryTriageTask:
                     continue
 
                 try:
-                    mirror_path = mirrors_by_repo.get(record.github_repo)
-                    if mirror_path is None:
-                        mirror_path = await sync_bare_mirror(
-                            self.mirrors_root,
-                            record.github_repo,
-                            self.settings.target_github_token,
-                        )
-                        mirrors_by_repo[record.github_repo] = mirror_path
-
                     (self.settings.state_dir / "caches" / "uv").mkdir(parents=True, exist_ok=True)
                     (self.settings.state_dir / "caches" / "npm").mkdir(parents=True, exist_ok=True)
                     (self.settings.state_dir / "agy-auth").mkdir(parents=True, exist_ok=True)
                     self.memory.ensure_dirs()
                     self.session_dir(record.issue_id)
                     art_dir = self.artifact_dir(record.issue_id)
+
+                    snapshot_file = art_dir / "repo_snapshot.tar.gz"
+                    has_repo_snapshot = snapshot_file.is_file() and snapshot_file.stat().st_size > 0
+                    mirror_path: Path | None = None
+                    if not has_repo_snapshot:
+                        mirror_path = mirrors_by_repo.get(record.github_repo)
+                        if mirror_path is None:
+                            mirror_path = await sync_bare_mirror(
+                                self.mirrors_root,
+                                record.github_repo,
+                                self.settings.resolve_github_token(record.github_repo),
+                            )
+                            mirrors_by_repo[record.github_repo] = mirror_path
 
                     is_handoff = False
                     handoff_backend_override: str | None = None
@@ -927,11 +931,12 @@ class SentryTriageTask:
                         and targets.agy_config.enabled
                         and targets.agy_config.github_repo.strip()
                     ):
+                        agy_cfg_repo = targets.agy_config.github_repo.strip()
                         try:
                             await sync_agy_config_repo(
                                 self.settings.state_dir / "agy-auth",
-                                targets.agy_config.github_repo.strip(),
-                                self.settings.target_github_token,
+                                agy_cfg_repo,
+                                self.settings.resolve_github_token(agy_cfg_repo),
                                 branch=targets.agy_config.branch.strip() or "main",
                             )
                         except Exception as cfg_exc:  # noqa: BLE001
@@ -941,7 +946,11 @@ class SentryTriageTask:
                                 error=str(cfg_exc),
                             )
 
-                    if record.task_kind == "sentry" and record.turn == 1:
+                    if (
+                        record.task_kind == "sentry"
+                        and record.turn == 1
+                        and mirror_path is not None
+                    ):
                         bundle_file = art_dir / "issue_bundle.json"
                         if bundle_file.exists():
                             bundle = SanitizedSentryBundle.model_validate_json(
@@ -973,10 +982,18 @@ class SentryTriageTask:
 
                     try:
                         await self.job_runner.spawn_job(
-                            record, target, worker_backend=worker_backend
+                            record,
+                            target,
+                            worker_backend=worker_backend,
+                            use_repo_snapshot=has_repo_snapshot,
                         )
                     except TypeError:
-                        await self.job_runner.spawn_job(record, target)
+                        try:
+                            await self.job_runner.spawn_job(
+                                record, target, worker_backend=worker_backend
+                            )
+                        except TypeError:
+                            await self.job_runner.spawn_job(record, target)
                     self.state.mark_status(record.issue_id, IssueStatus.RUNNING)
                     spawned += 1
                 except Exception as exc:

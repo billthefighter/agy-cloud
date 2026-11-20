@@ -4,8 +4,10 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import subprocess
 import tempfile
+import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -195,6 +197,191 @@ def _format_step_text(step_update: dict[str, Any], buffered_text: str) -> str:
     return ""
 
 
+DEFAULT_PROJECT_VENV_DIR = Path("/tmp/agy-work-venv")
+DEFAULT_VENV_SYNC_TIMEOUT_SECONDS = 120
+
+
+def _resolve_pyproject_dir(work_dir: Path, focus_subdir: str = "") -> Path | None:
+    """Return the project directory containing `pyproject.toml`, preferring `focus_subdir`."""
+    clean_focus = (focus_subdir or "").strip().strip("/")
+    if clean_focus:
+        focused = work_dir / clean_focus
+        if (focused / "pyproject.toml").is_file():
+            return focused
+    if (work_dir / "pyproject.toml").is_file():
+        return work_dir
+    return None
+
+
+def _inspect_pyproject(pyproject_path: Path) -> tuple[bool, bool]:
+    """Return `(is_uv_workspace, has_dev_extra)` from `pyproject.toml`."""
+    try:
+        data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return False, False
+    tool_uv = (data.get("tool") or {}).get("uv") or {}
+    is_workspace = isinstance(tool_uv, dict) and bool(tool_uv.get("workspace"))
+    opt_deps = (data.get("project") or {}).get("optional-dependencies") or {}
+    has_dev_extra = isinstance(opt_deps, dict) and "dev" in opt_deps
+    return is_workspace, has_dev_extra
+
+
+async def _prepare_project_venv(
+    work_dir: Path,
+    *,
+    focus_subdir: str = "",
+    venv_dir: Path | None = None,
+    timeout_seconds: int | None = None,
+) -> Path | None:
+    """Best-effort pre-sync of a repo's `pyproject.toml` into an out-of-tree venv before agent start.
+
+    Guardrails:
+    - Installs into `/tmp/agy-work-venv` (`UV_PROJECT_ENVIRONMENT`) so `.venv` never pollutes
+      `/work` or gets picked up by `git add -N .` / `git diff HEAD`.
+    - Skips multi-package `[tool.uv.workspace]` monorepos (where `verify_hint` selects specific
+      `--package` subsets) to avoid OOMing or downloading unrelated workspace members.
+    - Non-fatal and bounded by timeout so unusual build deps never block the worker from starting.
+    """
+    if os.environ.get("WORKER_AUTO_VENV", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return None
+    if shutil.which("uv") is None:
+        return None
+
+    project_dir = _resolve_pyproject_dir(work_dir, focus_subdir)
+    if project_dir is None:
+        return None
+
+    is_workspace, has_dev_extra = _inspect_pyproject(project_dir / "pyproject.toml")
+    if is_workspace:
+        log.info("worker.venv_sync_skipped_workspace", project_dir=str(project_dir))
+        return None
+
+    target_venv = venv_dir or Path(
+        os.environ.get("WORKER_PROJECT_VENV_DIR", str(DEFAULT_PROJECT_VENV_DIR))
+    )
+    sync_timeout = (
+        timeout_seconds
+        if timeout_seconds is not None
+        else int(
+            os.environ.get(
+                "WORKER_VENV_SYNC_TIMEOUT_SECONDS", str(DEFAULT_VENV_SYNC_TIMEOUT_SECONDS)
+            )
+        )
+    )
+    sync_env = {
+        **os.environ,
+        "UV_PROJECT_ENVIRONMENT": str(target_venv),
+    }
+
+    has_lock = (project_dir / "uv.lock").is_file()
+    extra_args = ["--extra", "dev"] if has_dev_extra else []
+
+    async def _run_cmd(cmd: list[str]) -> tuple[int, str]:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(project_dir),
+            env=sync_env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=sync_timeout)
+        except TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            raise
+        err_tail = (
+            stderr_b.decode("utf-8", errors="replace").strip()
+            or stdout_b.decode("utf-8", errors="replace").strip()
+        )[-400:]
+        return proc.returncode or 0, err_tail
+
+    try:
+        if has_lock:
+            rc, err_tail = await _run_cmd(["uv", "sync", "--frozen", "--no-progress", *extra_args])
+            if rc == 0 and (target_venv / "bin").is_dir():
+                log.info(
+                    "worker.venv_synced",
+                    project_dir=str(project_dir),
+                    venv_dir=str(target_venv),
+                    mode="uv_sync_frozen",
+                )
+                return target_venv
+            log.info(
+                "worker.venv_sync_frozen_fallback",
+                project_dir=str(project_dir),
+                returncode=rc,
+                error=err_tail,
+            )
+
+        # Fallback (or repos without uv.lock): create out-of-tree venv and editable-install
+        # via `uv pip install` so we never create or mutate `uv.lock` inside `/work`.
+        rc, err_tail = await _run_cmd(["uv", "venv", "--clear", str(target_venv)])
+        if rc != 0:
+            log.warning(
+                "worker.venv_create_failed",
+                project_dir=str(project_dir),
+                returncode=rc,
+                error=err_tail,
+            )
+            return None
+        install_target = ".[dev]" if has_dev_extra else "."
+        python_bin = str(target_venv / "bin" / "python")
+        rc, err_tail = await _run_cmd(
+            ["uv", "pip", "install", "--python", python_bin, "-e", install_target]
+        )
+        if rc == 0 and (target_venv / "bin").is_dir():
+            log.info(
+                "worker.venv_synced",
+                project_dir=str(project_dir),
+                venv_dir=str(target_venv),
+                mode="uv_pip_editable",
+            )
+            return target_venv
+        # Non-packaged app repos (flat-layout pyproject.toml without [build-system]) still have
+        # installable dependencies via `uv pip install -r pyproject.toml`.
+        req_cmd = ["uv", "pip", "install", "--python", python_bin, "-r", "pyproject.toml"]
+        if has_dev_extra:
+            req_cmd.extend(["--extra", "dev"])
+        rc2, err_tail2 = await _run_cmd(req_cmd)
+        if rc2 == 0 and (target_venv / "bin").is_dir():
+            log.info(
+                "worker.venv_synced",
+                project_dir=str(project_dir),
+                venv_dir=str(target_venv),
+                mode="uv_pip_requirements",
+            )
+            return target_venv
+        log.warning(
+            "worker.venv_pip_install_failed",
+            project_dir=str(project_dir),
+            returncode=rc2,
+            error=err_tail2 or err_tail,
+        )
+    except TimeoutError:
+        log.warning(
+            "worker.venv_sync_timeout",
+            project_dir=str(project_dir),
+            timeout_seconds=sync_timeout,
+        )
+    except OSError as exc:
+        log.warning("worker.venv_sync_error", project_dir=str(project_dir), error=str(exc))
+    return None
+
+
+def _build_venv_env_overrides(venv_dir: Path | None, base_env: dict[str, str]) -> dict[str, str]:
+    if venv_dir is None or not (venv_dir / "bin").is_dir():
+        return {}
+    bin_dir = str(venv_dir / "bin")
+    current_path = base_env.get("PATH", "")
+    path_parts = [p for p in current_path.split(os.pathsep) if p and p != bin_dir]
+    return {
+        "VIRTUAL_ENV": str(venv_dir),
+        "UV_PROJECT_ENVIRONMENT": str(venv_dir),
+        "PATH": os.pathsep.join([bin_dir, *path_parts]),
+    }
+
+
 async def _run_agy_cli_worker(
     *,
     prompt: str,
@@ -206,6 +393,7 @@ async def _run_agy_cli_worker(
     timeout_seconds: int,
     issue_id: str = "",
     artifacts_dir: Path | None = None,
+    venv_dir: Path | None = None,
 ) -> tuple[TriageReport | None, str, str, TokenUsageSummary, str]:
     """Execute a worker turn via the authenticated `agy` CLI (Google account subscription)."""
     cli_bin = os.environ.get("AGY_CLI_BIN", "agy").strip() or "agy"
@@ -247,6 +435,7 @@ async def _run_agy_cli_worker(
             for k, v in os.environ.items()
             if k not in {"GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTIGRAVITY_API_KEY"}
         }
+        cli_env.update(_build_venv_env_overrides(venv_dir, cli_env))
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=str(work_dir),
@@ -301,9 +490,7 @@ async def _run_agy_cli_worker(
                             step_buffers.setdefault(step_idx, []).append(delta)
                         if state == "DONE" and step_type != "user_input":
                             buf = "".join(
-                                step_buffers.pop(step_idx, [])
-                                if isinstance(step_idx, int)
-                                else []
+                                step_buffers.pop(step_idx, []) if isinstance(step_idx, int) else []
                             )
                             msg_text = _format_step_text(su, buf)
                             duration_s = su.get("duration_seconds")
@@ -478,6 +665,13 @@ async def run_worker() -> None:
         verify_hint=verify_hint,
     )
 
+    project_venv = await _prepare_project_venv(work_dir, focus_subdir=focus_subdir)
+    if project_venv is not None:
+        prompt = (
+            f"Pre-installed Python virtual environment is active on `PATH` at `{project_venv}` "
+            f"(`VIRTUAL_ENV` and `UV_PROJECT_ENVIRONMENT` are set).\n\n{prompt}"
+        )
+
     timeout_seconds = int(os.environ.get("WORKER_TIMEOUT_SECONDS", "1620"))
     log.info(
         "worker.starting",
@@ -487,6 +681,7 @@ async def run_worker() -> None:
         model=worker_model,
         worker_backend=worker_backend,
         timeout_seconds=timeout_seconds,
+        project_venv=str(project_venv) if project_venv is not None else "",
     )
     report: TriageReport | None = None
     conv_id = existing_conv_id or ""
@@ -495,20 +690,26 @@ async def run_worker() -> None:
     effective_model = worker_model
     try:
         if worker_backend == "agy_cli":
-            report, conv_id, stop_reason, usage_summary, effective_model = (
-                await _run_agy_cli_worker(
-                    prompt=prompt,
-                    effective_instructions=effective_instructions,
-                    worker_model=worker_model,
-                    work_dir=work_dir,
-                    turn=turn,
-                    existing_conv_id=existing_conv_id,
-                    timeout_seconds=timeout_seconds,
-                    issue_id=issue_id,
-                    artifacts_dir=artifacts_dir,
-                )
+            (
+                report,
+                conv_id,
+                stop_reason,
+                usage_summary,
+                effective_model,
+            ) = await _run_agy_cli_worker(
+                prompt=prompt,
+                effective_instructions=effective_instructions,
+                worker_model=worker_model,
+                work_dir=work_dir,
+                turn=turn,
+                existing_conv_id=existing_conv_id,
+                timeout_seconds=timeout_seconds,
+                issue_id=issue_id,
+                artifacts_dir=artifacts_dir,
+                venv_dir=project_venv,
             )
         else:
+            os.environ.update(_build_venv_env_overrides(project_venv, dict(os.environ)))
             report, conv_id, stop_reason, usage_summary, effective_model = await _run_sdk_worker(
                 prompt=prompt,
                 effective_instructions=effective_instructions,
