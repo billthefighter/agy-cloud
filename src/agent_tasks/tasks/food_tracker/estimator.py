@@ -49,6 +49,7 @@ def _is_retryable_model_error(exc: BaseException) -> bool:
         )
     )
 
+
 NUTRITION_SYSTEM_INSTRUCTIONS = """\
 You are a precision nutrition analyst estimating calories and macronutrients from meal photos,
 nutrition labels, and brief user descriptions.
@@ -159,7 +160,9 @@ def _format_reasoning_trace(chunks: list[Any]) -> str:
             args_str = json.dumps(args, ensure_ascii=False) if args else ""
             if len(args_str) > 500:
                 args_str = args_str[:500] + "…"
-            sections.append(f"**Tool Call:** `{name}`" + (f"\n```json\n{args_str}\n```" if args_str else ""))
+            sections.append(
+                f"**Tool Call:** `{name}`" + (f"\n```json\n{args_str}\n```" if args_str else "")
+            )
         elif cls_name == "ToolResult":
             name = str(getattr(chunk, "name", "tool"))
             err = getattr(chunk, "error", None)
@@ -232,10 +235,18 @@ class AgyNutritionEstimator:
         payload: str | list[Any],
         response_schema: type[MealEstimateSchema] | None,
         system_instructions: str,
+        enable_search_web: bool = True,
     ) -> tuple[Any, TokenUsageSummary, str]:
         # Imported lazily so macOS unit tests run without Linux compiled worker wheels.
         from google.antigravity import Agent, LocalAgentConfig, types
         from google.antigravity.hooks import policy
+
+        enabled_tools = [types.BuiltinTools.FINISH]
+        policies = []
+        if enable_search_web:
+            enabled_tools.insert(0, types.BuiltinTools.SEARCH_WEB)
+            policies.append(policy.allow("search_web"))
+        policies.extend([policy.allow("finish"), policy.deny_all()])
 
         agent_cfg = LocalAgentConfig(
             model=model,
@@ -244,16 +255,9 @@ class AgyNutritionEstimator:
             system_instructions=system_instructions,
             response_schema=response_schema,
             capabilities=types.CapabilitiesConfig(
-                enabled_tools=[
-                    types.BuiltinTools.SEARCH_WEB,
-                    types.BuiltinTools.FINISH,
-                ],
+                enabled_tools=enabled_tools,
             ),
-            policies=[
-                policy.allow("search_web"),
-                policy.allow("finish"),
-                policy.deny_all(),
-            ],
+            policies=policies,
             budget_config=types.BudgetConfig(
                 scope=types.BudgetScope.FORWARD_LOOKING,
                 max_model_calls=6,
@@ -300,6 +304,9 @@ class AgyNutritionEstimator:
         last_exc: BaseException | None = None
         for idx, model in enumerate(candidates):
             attempt_timeout = self._timeout_for_attempt(idx)
+            # `search_web` + `structured_output()` can stall past the timeout on some queries;
+            # disable web search on fallback attempts so the fallback resolves reliably.
+            enable_search_web = idx == 0
             try:
                 return await asyncio.wait_for(
                     self._run_single_model(
@@ -309,6 +316,7 @@ class AgyNutritionEstimator:
                         payload=payload,
                         response_schema=response_schema,
                         system_instructions=system_instructions,
+                        enable_search_web=enable_search_web,
                     ),
                     timeout=attempt_timeout,
                 )
@@ -323,6 +331,8 @@ class AgyNutritionEstimator:
                         next_model=candidates[idx + 1],
                         timeout_s=attempt_timeout,
                         next_timeout_s=self._timeout_for_attempt(idx + 1),
+                        use_search_web=enable_search_web,
+                        next_use_search_web=False,
                         error=type(exc).__name__ if isinstance(exc, TimeoutError) else str(exc),
                     )
                     continue
