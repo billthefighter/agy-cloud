@@ -30,6 +30,7 @@ spec:
         app.kubernetes.io/part-of: agent-tasks
     spec:
       serviceAccountName: agent-tasks-controller
+      terminationGracePeriodSeconds: 30
       imagePullSecrets:
         - name: ghcr-pull
       securityContext:
@@ -97,12 +98,20 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
+          lifecycle:
+            preStop:
+              exec:
+                # Allow Traefik/EndpointSlice propagation to drain traffic to the
+                # newly-ready surge pod before uvicorn stops accepting connections.
+                command: ["sh", "-c", "sleep 5"]
           readinessProbe:
             httpGet:
               path: /agy/healthz
               port: http-pwa
-            initialDelaySeconds: 5
-            periodSeconds: 15
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            timeoutSeconds: 3
+            failureThreshold: 3
           livenessProbe:
             exec:
               command: ["python3", "-c", "import os, time; assert time.time() - os.path.getmtime('/tmp/heartbeat') < 600"]

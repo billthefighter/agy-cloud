@@ -93,6 +93,7 @@ def migrate_agent_tasks_pvc(
         # Ensure `meals` view/table compatibility and count existing meal_entries
         with sqlite3.connect(health_db, timeout=30.0) as hconn:
             hconn.row_factory = sqlite3.Row
+            hconn.execute("PRAGMA busy_timeout=30000;")
             tables = {
                 str(r["name"])
                 for r in hconn.execute(
@@ -153,6 +154,7 @@ def migrate_agent_tasks_pvc(
                         weights_by_date[str(wrow["local_date"])] = float(wrow["weight_lbs"])
 
                 with sqlite3.connect(garmin_db, timeout=30.0) as gconn:
+                    gconn.execute("PRAGMA busy_timeout=30000;")
                     gconn.execute("PRAGMA journal_mode=WAL;")
                     gconn.execute(
                         """

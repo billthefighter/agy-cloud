@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import os
 import signal
+import socket
+import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any
 
 import structlog
 import uvicorn
@@ -65,6 +71,148 @@ async def _supervise_task(task: LongLivedTask) -> None:
         except Exception:
             log.exception("controller.task_crashed_restarting", task=task.name)
             await asyncio.sleep(10)
+
+
+class ControllerLeaderLock:
+    """Exclusive non-blocking POSIX flock on `/state/.controller.lock`.
+
+    Allows a newly-started RollingUpdate surge pod to bind the PWA HTTP server
+    and pass readiness probes immediately while waiting for the draining pod to
+    stop Slack Socket Mode and background pollers and release leadership.
+    Because `flock` is held by the kernel on the open file descriptor, an abrupt
+    SIGKILL/OOM automatically releases leadership with zero stale lock files.
+    """
+
+    def __init__(self, lock_path: Path) -> None:
+        self.lock_path = lock_path
+        self._fd: int | None = None
+
+    @property
+    def acquired(self) -> bool:
+        return self._fd is not None
+
+    def try_acquire(self) -> bool:
+        if self._fd is not None:
+            return True
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return False
+        except OSError:
+            os.close(fd)
+            raise
+
+        self._fd = fd
+        try:
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)
+            payload = (
+                f"pid={os.getpid()} host={socket.gethostname()} acquired_at={time.time():.3f}\n"
+            )
+            os.write(fd, payload.encode("utf-8"))
+        except OSError:
+            pass
+        return True
+
+    async def acquire(
+        self,
+        stop_event: asyncio.Event,
+        *,
+        poll_interval: float = 0.25,
+        heartbeat_cb: Callable[[], None] | None = None,
+    ) -> bool:
+        logged_wait = False
+        while not stop_event.is_set():
+            if self.try_acquire():
+                log.info("controller.leader_lock_acquired", lock_path=str(self.lock_path))
+                return True
+            if not logged_wait:
+                log.info("controller.waiting_for_leader_lock", lock_path=str(self.lock_path))
+                logged_wait = True
+            if heartbeat_cb is not None:
+                heartbeat_cb()
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=poll_interval)
+                return False
+            except TimeoutError:
+                continue
+        return False
+
+    def release(self) -> None:
+        fd = self._fd
+        if fd is None:
+            return
+        self._fd = None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        log.info("controller.leader_lock_released", lock_path=str(self.lock_path))
+
+
+async def _run_leader_work(
+    *,
+    leader_lock: ControllerLeaderLock,
+    stop_event: asyncio.Event,
+    background_tasks: Sequence[LongLivedTask],
+    slack: Any | None = None,
+    poll_interval: float = 0.25,
+    shutdown_timeout: float = 10.0,
+    heartbeat_cb: Callable[[], None] | None = None,
+) -> None:
+    """Hold exclusive leadership while running Slack Socket Mode and background pollers."""
+    acquired = await leader_lock.acquire(
+        stop_event,
+        poll_interval=poll_interval,
+        heartbeat_cb=heartbeat_cb,
+    )
+    if not acquired:
+        return
+
+    slack_started = False
+    bg_futures: list[asyncio.Task[None]] = []
+    try:
+        if slack is not None:
+            try:
+                await slack.start()
+                slack_started = True
+            except Exception as exc:  # noqa: BLE001
+                log.warning("controller.slack_start_failed", error=str(exc))
+
+        bg_futures = [
+            asyncio.create_task(_supervise_task(t), name=f"task-{t.name}") for t in background_tasks
+        ]
+        log.info(
+            "controller.leader_tasks_started",
+            slack_started=slack_started,
+            tasks=[t.name for t in background_tasks],
+        )
+        await stop_event.wait()
+    finally:
+        for fut in bg_futures:
+            fut.cancel()
+        if bg_futures:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*bg_futures, return_exceptions=True),
+                    timeout=shutdown_timeout,
+                )
+            except TimeoutError:
+                log.warning("controller.leader_tasks_shutdown_timeout", timeout_s=shutdown_timeout)
+        if slack is not None and slack_started:
+            try:
+                await asyncio.wait_for(slack.stop(), timeout=5.0)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("controller.slack_stop_failed", error=str(exc))
+        leader_lock.release()
 
 
 async def async_main() -> None:
@@ -368,7 +516,7 @@ async def async_main() -> None:
         )
         pwa_server = _ManagedUvicornServer(uv_config)
 
-    tasks: list[LongLivedTask] = [
+    background_tasks: list[LongLivedTask] = [
         sentry_task,
         slack_coding_task,
         ci_healer_task,
@@ -377,16 +525,33 @@ async def async_main() -> None:
         billing_task,
         food_task,
     ]
-    if pwa_server is not None:
-        tasks.append(_PwaServerTask(pwa_server))
 
-    await channel.start()
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop_event.set)
 
-    runner_futures = [asyncio.create_task(_supervise_task(t), name=f"task-{t.name}") for t in tasks]
+    pwa_task: asyncio.Task[None] | None = None
+    if pwa is not None:
+        await pwa.start()
+    if pwa_server is not None:
+        pwa_task = asyncio.create_task(
+            _supervise_task(_PwaServerTask(pwa_server)),
+            name="task-pwa-http-gateway",
+        )
+
+    leader_lock = ControllerLeaderLock(settings.state_dir / ".controller.lock")
+    leader_task = asyncio.create_task(
+        _run_leader_work(
+            leader_lock=leader_lock,
+            stop_event=stop_event,
+            background_tasks=background_tasks,
+            slack=slack,
+            heartbeat_cb=touch_heartbeat,
+        ),
+        name="controller-leader",
+    )
+
     log.info(
         "controller.started",
         namespace=settings.namespace,
@@ -395,7 +560,7 @@ async def async_main() -> None:
         slack_enabled=slack is not None,
         pwa_enabled=pwa is not None,
         pwa_port=settings.pwa_port if pwa is not None else None,
-        tasks=[t.name for t in tasks],
+        tasks=[t.name for t in background_tasks] + (["pwa-http-gateway"] if pwa_server else []),
     )
 
     try:
@@ -403,10 +568,15 @@ async def async_main() -> None:
     finally:
         if pwa_server is not None:
             pwa_server.should_exit = True
-        for fut in runner_futures:
-            fut.cancel()
-        await asyncio.gather(*runner_futures, return_exceptions=True)
-        await channel.stop()
+        if pwa is not None:
+            await pwa.stop()
+        await asyncio.gather(leader_task, return_exceptions=True)
+        if pwa_task is not None:
+            try:
+                await asyncio.wait_for(pwa_task, timeout=10.0)
+            except TimeoutError:
+                pwa_task.cancel()
+                await asyncio.gather(pwa_task, return_exceptions=True)
 
 
 def main() -> None:
