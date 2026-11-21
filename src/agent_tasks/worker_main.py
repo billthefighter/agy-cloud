@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -121,22 +122,46 @@ def _build_prompt(
     )
 
 
+_GIT_DIFF_EXCLUDE_PATHSPECS: tuple[str, ...] = (
+    ":(exclude)**/__pycache__/**",
+    ":(exclude)__pycache__/**",
+    ":(exclude)*.pyc",
+    ":(exclude)*.pyo",
+    ":(exclude)**/.pytest_cache/**",
+    ":(exclude).pytest_cache/**",
+)
+
+
+class WorkerTimeoutError(TimeoutError):
+    """Raised when a worker turn exceeds its timeout, preserving any streamed conversation ID."""
+
+    def __init__(self, message: str, *, conversation_id: str = "") -> None:
+        super().__init__(message)
+        self.conversation_id = conversation_id
+
+
 def _capture_git_diff(work_dir: Path) -> tuple[str, str]:
     # Track new untracked source files with intent-to-add so `git diff HEAD` includes them,
-    # while respecting the target repo's .gitignore. Pass `-c safe.directory=*` so ownership
+    # while respecting the target repo's .gitignore and excluding Python bytecode / pytest
+    # caches (even if previously tracked). Pass `-c safe.directory=*` so ownership
     # differences between the git-clone initContainer and worker container never trigger
     # `dubious ownership` (which causes `git diff --binary HEAD` to exit with status 129).
     git_prefix = ["git", "-c", "safe.directory=*", "-C", str(work_dir)]
-    subprocess.run([*git_prefix, "add", "-N", "."], check=False, capture_output=True, text=True)
+    subprocess.run(
+        [*git_prefix, "add", "-N", "--", ".", *_GIT_DIFF_EXCLUDE_PATHSPECS],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
     try:
         diff_proc = subprocess.run(
-            [*git_prefix, "diff", "--binary", "HEAD"],
+            [*git_prefix, "diff", "--binary", "HEAD", "--", ".", *_GIT_DIFF_EXCLUDE_PATHSPECS],
             check=True,
             capture_output=True,
             text=True,
         )
         stat_proc = subprocess.run(
-            [*git_prefix, "diff", "--stat", "HEAD"],
+            [*git_prefix, "diff", "--stat", "HEAD", "--", ".", *_GIT_DIFF_EXCLUDE_PATHSPECS],
             check=True,
             capture_output=True,
             text=True,
@@ -435,6 +460,7 @@ async def _run_agy_cli_worker(
             for k, v in os.environ.items()
             if k not in {"GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTIGRAVITY_API_KEY"}
         }
+        cli_env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
         cli_env.update(_build_venv_env_overrides(venv_dir, cli_env))
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -520,16 +546,22 @@ async def _run_agy_cli_worker(
                             result_payload = res
                 await proc.wait()
                 return await stderr_task
-            except Exception:
+            except BaseException:
                 stderr_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await stderr_task
                 raise
 
         try:
             stderr_b = await asyncio.wait_for(_consume_stream(), timeout=timeout_seconds)
-        except TimeoutError:
-            proc.kill()
-            await proc.communicate()
-            raise
+        except TimeoutError as exc:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            await proc.wait()
+            raise WorkerTimeoutError(
+                f"agy CLI timed out after {timeout_seconds}s",
+                conversation_id=streamed_conv_id or existing_conv_id or "",
+            ) from exc
 
         stdout_text = "\n".join(raw_stdout_lines)
         stderr_text = stderr_b.decode("utf-8", errors="replace")
@@ -750,7 +782,21 @@ async def run_worker() -> None:
             total_tokens=usage_summary.total_tokens,
         )
     except Exception as exc:
-        err_detail = f"{type(exc).__name__}: {exc}".rstrip(": ")
+        if isinstance(exc, WorkerTimeoutError) and exc.conversation_id:
+            conv_id = exc.conversation_id
+        partial_has_patch = False
+        partial_patch_stats = ""
+        if isinstance(exc, TimeoutError):
+            try:
+                diff_text, diff_stats = _capture_git_diff(work_dir)
+                if diff_text.strip():
+                    (artifacts_dir / "fix.patch").write_text(diff_text, encoding="utf-8")
+                    partial_has_patch = True
+                    partial_patch_stats = diff_stats
+            except Exception:  # noqa: BLE001
+                log.warning("worker.partial_diff_capture_failed", issue_id=issue_id, turn=turn)
+        err_name = "TimeoutError" if isinstance(exc, TimeoutError) else type(exc).__name__
+        err_detail = f"{err_name}: {exc}".rstrip(": ")
         log.exception("worker.failed", issue_id=issue_id, turn=turn, error=err_detail)
         envelope = WorkerEnvelope(
             issue_id=issue_id,
@@ -759,6 +805,8 @@ async def run_worker() -> None:
             model=effective_model,
             worker_backend=worker_backend,
             stop_reason=stop_reason,
+            has_patch=partial_has_patch,
+            patch_stats=partial_patch_stats,
             report=report,
             usage=usage_summary,
             error=err_detail,

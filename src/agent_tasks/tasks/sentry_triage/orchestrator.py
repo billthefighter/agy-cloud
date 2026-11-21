@@ -1237,10 +1237,30 @@ class SentryTriageTask:
                     await self.dispatch_pending()
                 continue
 
-            err_msg = raw_error or f"Worker Job ended with status={terminal}"
+            if raw_error:
+                err_msg = raw_error
+            elif envelope is not None and envelope.stop_reason not in (
+                "",
+                "UNSPECIFIED",
+                "SUCCESS",
+            ):
+                err_msg = (
+                    f"Worker stopped with stop_reason={envelope.stop_reason} "
+                    f"without producing a structured report"
+                )
+            elif terminal == "succeeded" and (envelope is None or envelope.report is None):
+                err_msg = "Worker Job succeeded without producing a structured report"
+            else:
+                err_msg = f"Worker Job ended with status={terminal}"
+            preserved_conv_id = (
+                (envelope.conversation_id if envelope is not None else "")
+                or record.conversation_id
+                or None
+            )
             self.state.mark_status(
                 record.issue_id,
                 IssueStatus.FAILED,
+                conversation_id=preserved_conv_id,
                 last_error=err_msg,
                 channel_id=target_channel,
             )

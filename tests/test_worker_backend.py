@@ -43,9 +43,7 @@ def test_resolve_worker_backend_defaults_and_overrides() -> None:
     assert resolve_worker_backend(targets, task_kind="ci_healer") == "agy_cli"
     # Explicit per-run override beats config
     assert (
-        resolve_worker_backend(
-            targets, task_kind="slack_coding", is_handoff=True, override="sdk"
-        )
+        resolve_worker_backend(targets, task_kind="slack_coding", is_handoff=True, override="sdk")
         == "sdk"
     )
 
@@ -147,9 +145,7 @@ async def test_handoff_service_defaults_to_agy_cli(tmp_path: Path) -> None:
     channels = MemoryChannelBus()
     svc = HandoffService(store=store, jobs=jobs, channels=channels, state_root=tmp_path)
 
-    await svc.create_handoff(
-        HandoffCreateRequest(github_repo="org/repo", prompt="Continue work")
-    )
+    await svc.create_handoff(HandoffCreateRequest(github_repo="org/repo", prompt="Continue work"))
     assert len(jobs.spawned_jobs) == 1
     assert jobs.spawned_jobs[0].worker_backend == "agy_cli"
 
@@ -168,9 +164,7 @@ async def test_run_worker_with_agy_cli_backend(
 
     # Initialize a tiny git repo in work_dir
     subprocess.run(["git", "init"], cwd=work_dir, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.com"], cwd=work_dir, check=True
-    )
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=work_dir, check=True)
     subprocess.run(["git", "config", "user.name", "Test"], cwd=work_dir, check=True)
     (work_dir / "hello.txt").write_text("before\n", encoding="utf-8")
     subprocess.run(["git", "add", "."], cwd=work_dir, check=True)
@@ -372,8 +366,12 @@ def test_sync_agy_config_repo_creates_relative_symlinks(tmp_path: Path) -> None:
     assert (agy_auth / "antigravity" / "hook_state").is_dir()
 
     # Re-sync idempotently after removing a skill
-    subprocess.run(["git", "rm", "-r", "skills/doomloop"], cwd=src_repo, check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "rm skill"], cwd=src_repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "rm", "-r", "skills/doomloop"], cwd=src_repo, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "rm skill"], cwd=src_repo, check=True, capture_output=True
+    )
     sync_agy_config_repo_sync(agy_auth, str(src_repo), "", branch="main")
     assert not (config_dir / "skills" / "doomloop").exists()
     assert not (config_dir / "skills" / "doomloop").is_symlink()
@@ -492,3 +490,266 @@ async def test_slack_coding_handoff_preserves_model_and_effort_from_handoff_meta
     rec = state.get_by_thread_ts(thread_ts)
     assert rec is not None
     assert rec.model_override == "gemini-4-neon-high"
+
+
+@pytest.mark.asyncio
+async def test_agy_cli_timeout_cleans_stderr_task_and_preserves_conv_and_partial_patch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test for HANDOFF-87C982: timeout must raise TimeoutError (not RuntimeError
+    from concurrent stderr read), preserve streamed conversation_id, and capture partial diff."""
+    work_dir = tmp_path / "work"
+    session_dir = tmp_path / "session"
+    artifacts_dir = tmp_path / "artifacts"
+    memory_dir = tmp_path / "memory"
+    work_dir.mkdir()
+    artifacts_dir.mkdir()
+    memory_dir.mkdir()
+
+    subprocess.run(["git", "init"], cwd=work_dir, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=work_dir, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=work_dir, check=True)
+    (work_dir / "app.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=work_dir, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=work_dir, check=True, capture_output=True)
+
+    (artifacts_dir / "task_prompt.md").write_text("Long task", encoding="utf-8")
+
+    fake_agy = tmp_path / "fake-agy-hang"
+    fake_agy.write_text(
+        """#!/usr/bin/env python3
+import json, sys, time
+from pathlib import Path
+
+print(json.dumps({"event": "init", "conversation_id": "conv-timeout-42"}), flush=True)
+Path("app.py").write_text("x = 2\\n", encoding="utf-8")
+print("stderr progress line", file=sys.stderr, flush=True)
+time.sleep(30)
+""",
+        encoding="utf-8",
+    )
+    fake_agy.chmod(fake_agy.stat().st_mode | stat.S_IEXEC)
+
+    monkeypatch.setenv("ISSUE_ID", "handoff-timeout-1")
+    monkeypatch.setenv("SHORT_ID", "HANDOFF-TIMEOUT")
+    monkeypatch.setenv("PROJECT_SLUG", "sdf_cam")
+    monkeypatch.setenv("TURN", "1")
+    monkeypatch.setenv("WORK_DIR", str(work_dir))
+    monkeypatch.setenv("SESSION_DIR", str(session_dir))
+    monkeypatch.setenv("ARTIFACTS_DIR", str(artifacts_dir))
+    monkeypatch.setenv("MEMORY_DIR", str(memory_dir))
+    monkeypatch.setenv("WORKER_BACKEND", "agy_cli")
+    monkeypatch.setenv("WORKER_MODEL", "gemini-4-neon-medium")
+    monkeypatch.setenv("WORKER_TIMEOUT_SECONDS", "1")
+    monkeypatch.setenv("AGY_CLI_BIN", str(fake_agy))
+
+    with pytest.raises(TimeoutError, match="timed out after 1s"):
+        await run_worker()
+
+    envelope = WorkerEnvelope.model_validate_json(
+        (artifacts_dir / "result.json").read_text(encoding="utf-8")
+    )
+    assert envelope.error is not None
+    assert envelope.error.startswith("TimeoutError:")
+    assert "already waiting for incoming data" not in envelope.error
+    assert envelope.conversation_id == "conv-timeout-42"
+    assert envelope.has_patch is True
+    assert "app.py" in envelope.patch_stats
+    patch_text = (artifacts_dir / "fix.patch").read_text(encoding="utf-8")
+    assert "+x = 2" in patch_text
+
+
+def test_capture_git_diff_excludes_pycache_pyc_and_pytest_cache(tmp_path: Path) -> None:
+    """Regression test for HANDOFF-6C5CEB: both untracked and tracked .pyc/cache files must
+    be excluded from captured worker patches."""
+    from agent_tasks.worker_main import _capture_git_diff
+
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "mod.py").write_text("v = 1\n", encoding="utf-8")
+    (tmp_path / "pkg" / "__pycache__").mkdir()
+    (tmp_path / "pkg" / "__pycache__" / "mod.cpython-314.pyc").write_bytes(b"\x00\x01old")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True)
+
+    # Modify real source, modify tracked .pyc, and create untracked .pyc + .pytest_cache
+    (tmp_path / "pkg" / "mod.py").write_text("v = 2\n", encoding="utf-8")
+    (tmp_path / "pkg" / "__pycache__" / "mod.cpython-314.pyc").write_bytes(b"\x00\x02new")
+    (tmp_path / "pkg" / "__pycache__" / "mod.cpython-312.pyc").write_bytes(b"\x00\x03added")
+    (tmp_path / ".pytest_cache").mkdir()
+    (tmp_path / ".pytest_cache" / "README.md").write_text("cache\n", encoding="utf-8")
+
+    diff_text, stat_text = _capture_git_diff(tmp_path)
+    assert "pkg/mod.py" in diff_text
+    assert "+v = 2" in diff_text
+    assert "__pycache__" not in diff_text
+    assert ".pyc" not in diff_text
+    assert ".pytest_cache" not in diff_text
+    assert "__pycache__" not in stat_text
+    assert "pkg/mod.py" in stat_text
+
+
+def test_k8s_job_manifest_wires_worker_timeout_and_dontwritebytecode() -> None:
+    settings = ControllerSettings(
+        namespace="agent-tasks",
+        target_github_token="ghp_test",
+        job_active_deadline_seconds=3600,
+    )
+    record = IssueRecord(
+        issue_id="slack-456",
+        short_id="HANDOFF-2",
+        project_slug="sdf_cam",
+        github_repo="billthefighter/sdf_cam",
+        default_branch="main",
+        title="Long build",
+        permalink="https://github.com/billthefighter/sdf_cam",
+        status=IssueStatus.QUEUED,
+        turn=1,
+        conversation_id=None,
+        thread_ts=None,
+        channel_id=None,
+        pr_url=None,
+        last_error=None,
+        updated_at="2026-11-21T00:00:00Z",
+        task_kind="slack_coding",
+    )
+    target = ProjectTargetConfig(github_repo="billthefighter/sdf_cam")
+
+    job = build_triage_job_manifest(
+        settings=settings, record=record, target=target, worker_backend="agy_cli"
+    )
+    worker = job.spec.template.spec.containers[0]
+    env_map = {e.name: e.value for e in worker.env}
+    assert job.spec.active_deadline_seconds == 3600
+    assert env_map["WORKER_TIMEOUT_SECONDS"] == "3420"
+    assert env_map["PYTHONDONTWRITEBYTECODE"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_surfaces_stop_reason_and_preserves_conversation_id(
+    tmp_path: Path,
+) -> None:
+    """Regression test for CI-44874125707: when job succeeds with report=None and
+    stop_reason=MAX_MODEL_CALLS_EXCEEDED, error message must name stop_reason and
+    preserve conversation_id."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from agent_tasks.common.state import StateStore
+    from agent_tasks.tasks.sentry_triage.orchestrator import SentryTriageTask
+
+    state = StateStore(tmp_path / "state.sqlite3")
+    settings = ControllerSettings(
+        state_dir=tmp_path,
+        targets_config_path=tmp_path / "missing.yaml",
+        target_github_token="ghp_test",
+    )
+    channel = MagicMock()
+    channel.resolve_channel_for_task.return_value = "C_CI"
+    channel.post_thread_message = AsyncMock(return_value="ts-1")
+    job_runner = AsyncMock()
+    job_runner.get_job_terminal_state = AsyncMock(return_value="succeeded")
+
+    orch = SentryTriageTask(
+        settings=settings,
+        state=state,
+        channel=channel,
+        job_runner=job_runner,
+        heartbeat_cb=lambda: None,
+    )
+    rec = state.register_if_new(
+        issue_id="ci-44874125707",
+        short_id="CI-44874125707",
+        project_slug="rattlsnek",
+        github_repo="lodbrok-app/rattlsnek",
+        default_branch="main",
+        title="Verify Changes failed",
+        permalink="https://github.com/lodbrok-app/rattlsnek/actions/runs/44874125707",
+        task_kind="ci_healer",
+    )
+    assert rec is not None
+    state.mark_status(rec.issue_id, IssueStatus.RUNNING, thread_ts="1795242078.265219")
+
+    art_dir = tmp_path / "artifacts" / rec.issue_id
+    art_dir.mkdir(parents=True, exist_ok=True)
+    envelope = WorkerEnvelope(
+        issue_id=rec.issue_id,
+        turn=1,
+        conversation_id="conv-ci-max-calls",
+        model="gemini-4-hydrogen",
+        worker_backend="sdk",
+        stop_reason="MAX_MODEL_CALLS_EXCEEDED",
+        has_patch=True,
+        patch_stats="1 file changed",
+        report=None,
+        error=None,
+    )
+    (art_dir / "result.json").write_text(envelope.model_dump_json(), encoding="utf-8")
+
+    await orch._reconcile_running_jobs()
+
+    updated = state.get_by_issue_id(rec.issue_id)
+    assert updated is not None
+    assert updated.status == IssueStatus.FAILED
+    assert updated.conversation_id == "conv-ci-max-calls"
+    assert updated.last_error is not None
+    assert "MAX_MODEL_CALLS_EXCEEDED" in updated.last_error
+    assert "status=succeeded" not in updated.last_error
+
+
+def test_migration_syncs_existing_handoff_status_and_ignores_unchanged_initial_patch(
+    tmp_path: Path,
+) -> None:
+    """Regression test for stale 'running' handoffs and false has_result_patch=True
+    when fix.patch still equals initial.patch or result.json says has_patch=False."""
+    import json
+
+    from agent_tasks.common.state import StateStore
+    from agy_cloud.core.migration import migrate_agent_tasks_pvc
+
+    state = StateStore(tmp_path / "state.sqlite3")
+    rec1 = state.register_if_new(
+        issue_id="slack-stale-run",
+        short_id="HANDOFF-STALE",
+        project_slug="rattlsnek",
+        github_repo="lodbrok-app/rattlsnek",
+        default_branch="main",
+        title="Stale running test",
+        permalink="",
+        task_kind="slack_coding",
+    )
+    assert rec1 is not None
+    state.mark_status(rec1.issue_id, IssueStatus.RUNNING)
+
+    # First migration imports it as running
+    migrate_agent_tasks_pvc(tmp_path)
+    hstore = HandoffStore(tmp_path / "handoffs.sqlite3")
+    imported = hstore.get(rec1.issue_id)
+    assert imported is not None
+    assert imported.status == "running"
+
+    # Now issue fails in state.sqlite3 AND has initial.patch == fix.patch + result.json has_patch=False
+    state.mark_status(
+        rec1.issue_id,
+        IssueStatus.FAILED,
+        conversation_id="conv-resumable",
+        last_error="TimeoutError: agy CLI timed out after 1620s",
+    )
+    art_dir = tmp_path / "artifacts" / rec1.issue_id
+    art_dir.mkdir(parents=True, exist_ok=True)
+    (art_dir / "initial.patch").write_text("diff --git a/a b/a\n+laptop\n", encoding="utf-8")
+    (art_dir / "fix.patch").write_text("diff --git a/a b/a\n+laptop\n", encoding="utf-8")
+    (art_dir / "result.json").write_text(
+        json.dumps({"has_patch": False, "error": "TimeoutError"}), encoding="utf-8"
+    )
+
+    # Second migration must sync status, last_error, conversation_id, and has_result_patch=False
+    migrate_agent_tasks_pvc(tmp_path)
+    synced = hstore.get(rec1.issue_id)
+    assert synced is not None
+    assert synced.status == "failed"
+    assert synced.remote_conversation_id == "conv-resumable"
+    assert synced.last_error == "TimeoutError: agy CLI timed out after 1620s"
+    assert synced.has_result_patch is False

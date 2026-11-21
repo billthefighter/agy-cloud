@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from dataclasses import dataclass, field
@@ -219,12 +220,27 @@ def migrate_agent_tasks_pvc(
                 ).fetchall()
                 for row in rows:
                     issue_id = str(row["issue_id"])
-                    if handoff_store.get(issue_id) is not None:
-                        continue
                     art_dir = state_dir / "artifacts" / issue_id
-                    has_patch = (art_dir / "fix.patch").is_file() and bool(
-                        (art_dir / "fix.patch").read_text(encoding="utf-8", errors="ignore").strip()
-                    )
+                    has_patch = _artifact_has_result_patch(art_dir)
+                    new_status = str(row["status"]).lower()
+                    new_conv_id = row["conversation_id"]
+                    new_last_error = row["last_error"]
+                    existing = handoff_store.get(issue_id)
+                    if existing is not None:
+                        if (
+                            existing.status != new_status
+                            or existing.last_error != new_last_error
+                            or existing.has_result_patch != has_patch
+                            or (new_conv_id and existing.remote_conversation_id != new_conv_id)
+                        ):
+                            handoff_store.update_status(
+                                issue_id,
+                                status=new_status,
+                                remote_conversation_id=new_conv_id,
+                                has_result_patch=has_patch,
+                                last_error=new_last_error,
+                            )
+                        continue
                     handoff_store.create(
                         HandoffRecord(
                             handoff_id=issue_id,
@@ -237,11 +253,11 @@ def migrate_agent_tasks_pvc(
                             verify_hint="",
                             focus_subdir="",
                             model=str(row["model_override"] or "gemini-4-hydrogen"),
-                            status=str(row["status"]).lower(),
+                            status=new_status,
                             turn=max(1, int(row["turn"] or 1)),
-                            remote_conversation_id=row["conversation_id"],
+                            remote_conversation_id=new_conv_id,
                             has_result_patch=has_patch,
-                            last_error=row["last_error"],
+                            last_error=new_last_error,
                             created_at=str(row["updated_at"]),
                             updated_at=str(row["updated_at"]),
                         )
@@ -249,3 +265,26 @@ def migrate_agent_tasks_pvc(
                     report.handoffs_imported += 1
 
     return report
+
+
+def _artifact_has_result_patch(art_dir: Path) -> bool:
+    """Determine whether an artifact directory contains an actual worker-produced result patch."""
+    result_file = art_dir / "result.json"
+    if result_file.is_file():
+        try:
+            payload = json.loads(result_file.read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and isinstance(payload.get("has_patch"), bool):
+                return payload["has_patch"]
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    fix_patch = art_dir / "fix.patch"
+    if not fix_patch.is_file():
+        return False
+    fix_bytes = fix_patch.read_bytes()
+    if not fix_bytes.strip():
+        return False
+    initial_patch = art_dir / "initial.patch"
+    if initial_patch.is_file() and initial_patch.read_bytes() == fix_bytes:
+        return False
+    return True

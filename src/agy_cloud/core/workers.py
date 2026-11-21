@@ -255,13 +255,21 @@ class LocalSubprocessWorkerJobService(WorkerJobServiceProtocol):
                 text=True,
             )
             if (wdir / ".git").exists():
+                excludes = (
+                    ":(exclude)**/__pycache__/**",
+                    ":(exclude)__pycache__/**",
+                    ":(exclude)*.pyc",
+                    ":(exclude)*.pyo",
+                    ":(exclude)**/.pytest_cache/**",
+                    ":(exclude).pytest_cache/**",
+                )
                 subprocess.run(
-                    ["git", "-C", str(wdir), "add", "-N", "."],
+                    ["git", "-C", str(wdir), "add", "-N", "--", ".", *excludes],
                     check=False,
                     capture_output=True,
                 )
                 diff_out = subprocess.run(
-                    ["git", "-C", str(wdir), "diff", "--binary", "HEAD"],
+                    ["git", "-C", str(wdir), "diff", "--binary", "HEAD", "--", ".", *excludes],
                     check=True,
                     capture_output=True,
                     text=True,

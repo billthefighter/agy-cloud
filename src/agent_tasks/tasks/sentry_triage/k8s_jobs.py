@@ -124,6 +124,7 @@ def build_triage_job_manifest(
     )
 
     use_agy_cli = worker_backend == "agy_cli"
+    worker_timeout_seconds = max(60, int(settings.job_active_deadline_seconds) - 180)
     worker_env = [
         client.V1EnvVar(name="ISSUE_ID", value=record.issue_id),
         client.V1EnvVar(name="SHORT_ID", value=record.short_id),
@@ -132,6 +133,8 @@ def build_triage_job_manifest(
         client.V1EnvVar(name="TASK_KIND", value=record.task_kind),
         client.V1EnvVar(name="WORKER_BACKEND", value=worker_backend),
         client.V1EnvVar(name="WORKER_MODEL", value=worker_model),
+        client.V1EnvVar(name="WORKER_TIMEOUT_SECONDS", value=str(worker_timeout_seconds)),
+        client.V1EnvVar(name="PYTHONDONTWRITEBYTECODE", value="1"),
         client.V1EnvVar(name="TURN", value=str(record.turn)),
         client.V1EnvVar(name="CONVERSATION_ID", value=record.conversation_id or ""),
         client.V1EnvVar(name="FOCUS_SUBDIR", value=target.focus_subdir or ""),
