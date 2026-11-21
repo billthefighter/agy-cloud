@@ -605,7 +605,8 @@ class NutritionStore:
                     total_c,
                     total_f,
                     total_fiber,
-                    (reasoning_trace or getattr(estimate, "_reasoning_trace", None) or "").strip() or None,
+                    (reasoning_trace or getattr(estimate, "_reasoning_trace", None) or "").strip()
+                    or None,
                     now,
                 ),
             )
@@ -808,7 +809,8 @@ class NutritionStore:
                     total_c,
                     total_f,
                     total_fiber,
-                    (reasoning_trace or getattr(estimate, "_reasoning_trace", None) or "").strip() or None,
+                    (reasoning_trace or getattr(estimate, "_reasoning_trace", None) or "").strip()
+                    or None,
                     now,
                     entry_id,
                 ),
