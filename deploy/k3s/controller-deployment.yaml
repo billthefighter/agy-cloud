@@ -42,7 +42,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: controller
-          image: ghcr.io/billthefighter/agy-cloud/controller:sha-4d913f8
+          image: ghcr.io/billthefighter/agy-cloud/controller:sha-3c8059e
           imagePullPolicy: Always
           command: ["agent-tasks-controller"]
           args: []
