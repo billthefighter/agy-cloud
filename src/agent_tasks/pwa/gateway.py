@@ -280,6 +280,27 @@ class _LogAgainRequest(BaseModel):
     local_date: str = ""
 
 
+class _UpdateMealItemRequest(BaseModel):
+    name: str
+    quantity_desc: str = "1 serving"
+    estimated_grams: float | None = None
+    calories_kcal: float
+    protein_g: float = 0.0
+    carbs_g: float = 0.0
+    fat_g: float = 0.0
+    fiber_g: float = 0.0
+    source: str = "user_edit"
+
+
+class _UpdateMealRequest(BaseModel):
+    local_date: str | None = None
+    meal_slot: str | None = None
+    title: str | None = None
+    scale_factor: float | None = None
+    items: list[_UpdateMealItemRequest] | None = None
+    view_date: str = ""
+
+
 class _MealReactionRequest(BaseModel):
     emoji: str | None = None
 
@@ -2394,6 +2415,59 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
             },
         )
         return gateway._build_food_today_payload(local_date=cloned.local_date)
+
+    @router.patch("/api/food/entries/{entry_id}", dependencies=[Depends(_require_auth)])
+    async def food_update(entry_id: int, body: _UpdateMealRequest) -> dict[str, Any]:
+        if gateway.food_task is None:
+            raise HTTPException(status_code=503, detail="Food tracker is not enabled.")
+
+        from agent_tasks.tasks.food_tracker.models import EstimatedMealItem
+
+        items_payload: list[EstimatedMealItem] | None = None
+        if body.items is not None:
+            valid_sources = {"vision_estimate", "nutrition_label", "saved_food", "user_edit"}
+            items_payload = [
+                EstimatedMealItem(
+                    name=it.name.strip() or "Food item",
+                    quantity_desc=it.quantity_desc.strip() or "1 serving",
+                    estimated_grams=it.estimated_grams,
+                    calories_kcal=it.calories_kcal,
+                    protein_g=it.protein_g,
+                    carbs_g=it.carbs_g,
+                    fat_g=it.fat_g,
+                    fiber_g=it.fiber_g,
+                    source=it.source if it.source in valid_sources else "user_edit",  # type: ignore[arg-type]
+                )
+                for it in body.items
+            ]
+
+        try:
+            updated = gateway.food_task.nutrition.update_meal_entry(
+                entry_id,
+                local_date=body.local_date,
+                meal_slot=body.meal_slot,  # type: ignore[arg-type]
+                title=body.title,
+                scale_factor=body.scale_factor,
+                items=items_payload,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        await gateway.broadcast(
+            "food.updated",
+            {
+                "source": "edit",
+                "entry_id": updated.id,
+                "meal_title": updated.title,
+                "local_date": updated.local_date,
+            },
+        )
+        view_date = body.view_date.strip() or updated.local_date
+        payload = gateway._build_food_today_payload(local_date=view_date)
+        payload["meal"] = gateway._serialize_meal(updated)
+        return payload
 
     @router.delete("/api/food/entries/{entry_id}", dependencies=[Depends(_require_auth)])
     async def food_delete(entry_id: int) -> dict[str, Any]:

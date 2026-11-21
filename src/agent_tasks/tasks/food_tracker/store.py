@@ -817,6 +817,108 @@ class NutritionStore:
             assert updated is not None
             return updated
 
+    def update_meal_entry(
+        self,
+        entry_id: int,
+        *,
+        local_date: str | None = None,
+        meal_slot: MealSlot | None = None,
+        title: str | None = None,
+        scale_factor: float | None = None,
+        items: list[EstimatedMealItem] | None = None,
+    ) -> MealEntryRecord:
+        """Update editable metadata and/or itemized macros for an existing meal entry."""
+        now = self._now()
+        with self._connect() as conn:
+            existing = self._fetch_entry_with_items(conn, entry_id)
+            if existing is None or existing.status == "deleted":
+                raise KeyError(f"Unknown meal_entry id: {entry_id}")
+
+            if local_date is not None:
+                resolved_date = resolve_valid_local_date(local_date.strip(), "")
+                if not resolved_date:
+                    raise ValueError(f"Invalid local_date: {local_date!r}")
+            else:
+                resolved_date = existing.local_date
+
+            resolved_slot = meal_slot if meal_slot is not None else existing.meal_slot
+            if resolved_slot not in ("breakfast", "lunch", "dinner", "snack"):
+                raise ValueError(f"Invalid meal_slot: {meal_slot!r}")
+
+            resolved_title = (
+                title.strip() if title is not None and title.strip() else existing.title
+            )
+            resolved_scale = (
+                max(0.1, min(10.0, float(scale_factor)))
+                if scale_factor is not None
+                else float(existing.scale_factor)
+            )
+
+            if items is not None:
+                normalized_items = [normalize_item_macros(item)[0] for item in items]
+                conn.execute("DELETE FROM meal_items WHERE meal_entry_id = ?", (entry_id,))
+                for item in normalized_items:
+                    conn.execute(
+                        """
+                        INSERT INTO meal_items (
+                            meal_entry_id, saved_food_id, name, quantity_desc, estimated_grams,
+                            calories_kcal, protein_g, carbs_g, fat_g, fiber_g, source
+                        ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            entry_id,
+                            item.name,
+                            item.quantity_desc,
+                            item.estimated_grams,
+                            item.calories_kcal,
+                            item.protein_g,
+                            item.carbs_g,
+                            item.fat_g,
+                            item.fiber_g,
+                            item.source,
+                        ),
+                    )
+                total_kcal, total_p, total_c, total_f, total_fiber = _sum_scaled_items(
+                    normalized_items, resolved_scale
+                )
+            else:
+                total_kcal, total_p, total_c, total_f, total_fiber = _sum_scaled_items(
+                    existing.items, resolved_scale
+                )
+
+            conn.execute(
+                """
+                UPDATE meal_entries
+                SET local_date = ?,
+                    meal_slot = ?,
+                    title = ?,
+                    scale_factor = ?,
+                    total_calories_kcal = ?,
+                    total_protein_g = ?,
+                    total_carbs_g = ?,
+                    total_fat_g = ?,
+                    total_fiber_g = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    resolved_date,
+                    resolved_slot,
+                    resolved_title,
+                    resolved_scale,
+                    total_kcal,
+                    total_p,
+                    total_c,
+                    total_f,
+                    total_fiber,
+                    now,
+                    entry_id,
+                ),
+            )
+            updated = self._fetch_entry_with_items(conn, entry_id)
+            assert updated is not None
+            return updated
+
     def soft_delete_meal(self, entry_id: int) -> MealEntryRecord:
         now = self._now()
         with self._connect() as conn:

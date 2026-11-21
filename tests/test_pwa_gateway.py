@@ -887,6 +887,49 @@ def test_health_meal_reaction_endpoint_and_ui_assets(tmp_path: Path) -> None:
         )
         assert missing.status_code == 404
 
+        patch_ok = client.patch(
+            f"/health/api/food/entries/{meal.id}",
+            headers=headers,
+            json={
+                "local_date": "2026-11-19",
+                "meal_slot": "snack",
+                "title": "Toffee Squares",
+                "scale_factor": 1.5,
+                "items": [
+                    {
+                        "name": "Almond Toffee",
+                        "quantity_desc": "4 squares",
+                        "calories_kcal": 200,
+                        "protein_g": 2,
+                        "carbs_g": 20,
+                        "fat_g": 12,
+                        "fiber_g": 1,
+                    }
+                ],
+            },
+        )
+        assert patch_ok.status_code == 200
+        patched = patch_ok.json()
+        assert patched["meal"]["local_date"] == "2026-11-19"
+        assert patched["meal"]["meal_slot"] == "snack"
+        assert patched["meal"]["title"] == "Toffee Squares"
+        assert patched["meal"]["total_calories_kcal"] == 300.0
+        assert patched["meal"]["items"][0]["source"] == "user_edit"
+
+        patch_bad_date = client.patch(
+            f"/health/api/food/entries/{meal.id}",
+            headers=headers,
+            json={"local_date": "not-a-date"},
+        )
+        assert patch_bad_date.status_code == 400
+
+        patch_missing = client.patch(
+            "/health/api/food/entries/999999",
+            headers=headers,
+            json={"title": "Ghost"},
+        )
+        assert patch_missing.status_code == 404
+
 
 def test_handoff_lifecycle_create_poll_and_pull(tmp_path: Path) -> None:
     from agent_tasks.common.models import TokenUsageSummary, TriageReport, WorkerEnvelope
