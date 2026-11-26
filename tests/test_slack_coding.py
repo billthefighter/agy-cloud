@@ -290,3 +290,55 @@ async def test_run_loop_calls_heartbeat_and_handles_cancellation(
 
     assert heartbeats == 1
     assert sleep_durations == [60]
+
+
+async def test_async_dispatch_returns_immediately_and_lists_context_files(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    store = StateStore(tmp_path / "state.sqlite3")
+    dispatch_started = asyncio.Event()
+    allow_finish = asyncio.Event()
+
+    async def slow_dispatch() -> None:
+        dispatch_started.set()
+        await allow_finish.wait()
+
+    task = SlackCodingTask(
+        settings=_make_settings(tmp_path),
+        state=store,
+        dispatch_callback=slow_dispatch,
+    )
+    thread_ts = "1731620999.000100"
+    issue_id = f"slack-{thread_ts.replace('.', '-')}"
+    art_dir = tmp_path / "artifacts" / issue_id
+    art_dir.mkdir(parents=True, exist_ok=True)
+    (art_dir / "handoff_meta.json").write_text(
+        json.dumps(
+            {
+                "is_handoff": True,
+                "context_files": ["plan.md", "notes.txt"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    ack = await task.handle_coding_request(
+        prompt_text="Implement feature",
+        user="laptop-handoff",
+        thread_ts=thread_ts,
+        channel_id="pwa:coding",
+        async_dispatch=True,
+    )
+    assert "Queued coding task" in ack
+    assert not allow_finish.is_set()
+    await asyncio.wait_for(dispatch_started.wait(), timeout=2.0)
+
+    prompt_md = (art_dir / "task_prompt.md").read_text(encoding="utf-8")
+    assert "## Attached Context Files" in prompt_md
+    assert "/artifacts/context/plan.md" in prompt_md
+    assert "/artifacts/context/notes.txt" in prompt_md
+
+    allow_finish.set()
+    await asyncio.gather(*list(task._background_tasks))

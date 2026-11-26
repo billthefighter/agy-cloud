@@ -908,6 +908,7 @@ class SentryTriageTask:
 
                     is_handoff = False
                     handoff_backend_override: str | None = None
+                    handoff_timeout_override: int | None = None
                     meta_file = art_dir / "handoff_meta.json"
                     if meta_file.exists():
                         try:
@@ -917,8 +918,26 @@ class SentryTriageTask:
                                 raw_b = meta_obj.get("worker_backend")
                                 if isinstance(raw_b, str) and raw_b.strip():
                                     handoff_backend_override = raw_b.strip()
+                                raw_timeout = meta_obj.get("timeout_seconds")
+                                if isinstance(raw_timeout, (int, float)) and raw_timeout > 0:
+                                    handoff_timeout_override = int(raw_timeout)
                         except (OSError, json.JSONDecodeError):
                             pass
+
+                    if is_handoff or record.task_kind == "slack_coding":
+                        if handoff_timeout_override is not None:
+                            effective_deadline = max(
+                                300,
+                                min(
+                                    handoff_timeout_override,
+                                    self.settings.handoff_max_deadline_seconds,
+                                ),
+                            )
+                        else:
+                            effective_deadline = self.settings.handoff_active_deadline_seconds
+                    else:
+                        effective_deadline = self.settings.job_active_deadline_seconds
+                    effective_idle_timeout = self.settings.worker_idle_timeout_seconds
 
                     worker_backend = resolve_worker_backend(
                         targets,
@@ -986,14 +1005,24 @@ class SentryTriageTask:
                             target,
                             worker_backend=worker_backend,
                             use_repo_snapshot=has_repo_snapshot,
+                            active_deadline_seconds=effective_deadline,
+                            worker_idle_timeout_seconds=effective_idle_timeout,
                         )
                     except TypeError:
                         try:
                             await self.job_runner.spawn_job(
-                                record, target, worker_backend=worker_backend
+                                record,
+                                target,
+                                worker_backend=worker_backend,
+                                use_repo_snapshot=has_repo_snapshot,
                             )
                         except TypeError:
-                            await self.job_runner.spawn_job(record, target)
+                            try:
+                                await self.job_runner.spawn_job(
+                                    record, target, worker_backend=worker_backend
+                                )
+                            except TypeError:
+                                await self.job_runner.spawn_job(record, target)
                     self.state.mark_status(record.issue_id, IssueStatus.RUNNING)
                     spawned += 1
                 except Exception as exc:
@@ -1257,6 +1286,80 @@ class SentryTriageTask:
                 or record.conversation_id
                 or None
             )
+
+            # Productive-timeout auto-continuation for handoff / slack_coding turns
+            meta_file = art_dir / "handoff_meta.json"
+            handoff_meta: dict[str, object] = {}
+            if meta_file.exists():
+                try:
+                    raw_meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                    if isinstance(raw_meta, dict):
+                        handoff_meta = raw_meta
+                except (OSError, json.JSONDecodeError):
+                    handoff_meta = {}
+            is_handoff_or_coding = record.task_kind == "slack_coding" or bool(
+                handoff_meta.get("is_handoff")
+            )
+            err_lower = err_msg.lower()
+            is_productive_wall_timeout = (
+                "timed out after" in err_lower
+                and "stalled" not in err_lower
+                and "workerstallerror" not in err_lower
+            )
+            raw_auto_count = handoff_meta.get("auto_continue_count", 0)
+            auto_continue_count = (
+                int(raw_auto_count) if isinstance(raw_auto_count, (int, float)) else 0
+            )
+            if (
+                is_handoff_or_coding
+                and is_productive_wall_timeout
+                and preserved_conv_id
+                and auto_continue_count < self.settings.max_handoff_auto_continues
+            ):
+                next_auto_count = auto_continue_count + 1
+                handoff_meta["auto_continue_count"] = next_auto_count
+                meta_file.write_text(json.dumps(handoff_meta, indent=2), encoding="utf-8")
+                self.state.mark_status(
+                    record.issue_id,
+                    record.status,
+                    conversation_id=preserved_conv_id,
+                    channel_id=target_channel,
+                )
+                bumped = self.state.bump_turn_for_feedback(record.issue_id)
+                (art_dir / f"feedback-turn-{bumped.turn}.txt").write_text(
+                    (
+                        f"Your previous turn (turn {record.turn}) reached its wall-clock time limit "
+                        f"while actively making progress (auto-continuation {next_auto_count}/"
+                        f"{self.settings.max_handoff_auto_continues}). "
+                        "Your partial changes are already applied in `/work`. "
+                        "Inspect `git status` / `git diff HEAD`, resume from where you left off, "
+                        "finish any remaining work and verification, and return a complete TriageReport."
+                    ),
+                    encoding="utf-8",
+                )
+                log.info(
+                    "triage.auto_continued_after_timeout",
+                    issue_id=record.issue_id,
+                    short_id=record.short_id,
+                    prev_turn=record.turn,
+                    next_turn=bumped.turn,
+                    auto_continue_count=next_auto_count,
+                    max_auto_continues=self.settings.max_handoff_auto_continues,
+                )
+                if record.thread_ts:
+                    await self.channel.post_thread_message(
+                        record.thread_ts,
+                        (
+                            f"⏳ Turn {record.turn} for `{record.short_id}` hit the wall-clock timeout "
+                            f"while actively progressing — auto-continuing on turn {bumped.turn} "
+                            f"({next_auto_count}/{self.settings.max_handoff_auto_continues}) "
+                            f"from partial changes in `/work`…"
+                        ),
+                        channel_id=target_channel,
+                    )
+                await self.dispatch_pending()
+                continue
+
             self.state.mark_status(
                 record.issue_id,
                 IssueStatus.FAILED,

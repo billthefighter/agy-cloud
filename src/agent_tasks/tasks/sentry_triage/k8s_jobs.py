@@ -25,6 +25,8 @@ def build_triage_job_manifest(
     target: ProjectTargetConfig,
     worker_backend: str = "sdk",
     use_repo_snapshot: bool = False,
+    active_deadline_seconds: int | None = None,
+    worker_idle_timeout_seconds: int | None = None,
 ) -> client.V1Job:
     """Build a locked-down Kubernetes batch/v1 Job for isolated AGY triage on makesense.
 
@@ -124,7 +126,18 @@ def build_triage_job_manifest(
     )
 
     use_agy_cli = worker_backend == "agy_cli"
-    worker_timeout_seconds = max(60, int(settings.job_active_deadline_seconds) - 180)
+    effective_deadline = (
+        int(active_deadline_seconds)
+        if active_deadline_seconds is not None
+        else int(settings.job_active_deadline_seconds)
+    )
+    effective_idle_timeout = (
+        int(worker_idle_timeout_seconds)
+        if worker_idle_timeout_seconds is not None
+        else int(settings.worker_idle_timeout_seconds)
+    )
+    deadline_margin = 300 if effective_deadline >= 1800 else 180
+    worker_timeout_seconds = max(60, effective_deadline - deadline_margin)
     worker_env = [
         client.V1EnvVar(name="ISSUE_ID", value=record.issue_id),
         client.V1EnvVar(name="SHORT_ID", value=record.short_id),
@@ -134,6 +147,7 @@ def build_triage_job_manifest(
         client.V1EnvVar(name="WORKER_BACKEND", value=worker_backend),
         client.V1EnvVar(name="WORKER_MODEL", value=worker_model),
         client.V1EnvVar(name="WORKER_TIMEOUT_SECONDS", value=str(worker_timeout_seconds)),
+        client.V1EnvVar(name="WORKER_IDLE_TIMEOUT_SECONDS", value=str(effective_idle_timeout)),
         client.V1EnvVar(name="PYTHONDONTWRITEBYTECODE", value="1"),
         client.V1EnvVar(name="TURN", value=str(record.turn)),
         client.V1EnvVar(name="CONVERSATION_ID", value=record.conversation_id or ""),
@@ -274,7 +288,7 @@ def build_triage_job_manifest(
         ),
         spec=client.V1JobSpec(
             backoff_limit=0,
-            active_deadline_seconds=settings.job_active_deadline_seconds,
+            active_deadline_seconds=effective_deadline,
             ttl_seconds_after_finished=settings.job_ttl_seconds_after_finished,
             template=client.V1PodTemplateSpec(
                 metadata=client.V1ObjectMeta(labels=labels),
@@ -302,6 +316,8 @@ class K8sJobRunner:
         *,
         worker_backend: str = "sdk",
         use_repo_snapshot: bool = False,
+        active_deadline_seconds: int | None = None,
+        worker_idle_timeout_seconds: int | None = None,
     ) -> str:
         manifest = build_triage_job_manifest(
             settings=self.settings,
@@ -309,6 +325,8 @@ class K8sJobRunner:
             target=target,
             worker_backend=worker_backend,
             use_repo_snapshot=use_repo_snapshot,
+            active_deadline_seconds=active_deadline_seconds,
+            worker_idle_timeout_seconds=worker_idle_timeout_seconds,
         )
         job_name = manifest.metadata.name
 

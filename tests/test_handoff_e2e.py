@@ -36,7 +36,9 @@ class _TestClientHandoffHttpAdapter:
 
     def create_handoff(self, payload: dict[str, Any]) -> dict[str, Any]:
         resp = self._client.post("/agy/api/handoff", json=payload, headers=self._headers)
-        assert resp.status_code == 200, f"POST /agy/api/handoff failed: {resp.status_code} {resp.text}"
+        assert resp.status_code == 200, (
+            f"POST /agy/api/handoff failed: {resp.status_code} {resp.text}"
+        )
         return resp.json()
 
     def get_handoff(
@@ -47,7 +49,9 @@ class _TestClientHandoffHttpAdapter:
             params={"repo": repo, "include_diff": "true" if include_diff else "false"},
             headers=self._headers,
         )
-        assert resp.status_code == 200, f"GET /agy/api/handoff failed: {resp.status_code} {resp.text}"
+        assert resp.status_code == 200, (
+            f"GET /agy/api/handoff failed: {resp.status_code} {resp.text}"
+        )
         return resp.json()
 
 
@@ -391,11 +395,7 @@ def test_portable_handoff_client_rejects_oversized_unpushed_patch(
 
     _origin_mirror, laptop, _main_sha, _local_head_sha = _setup_origin_and_laptop(tmp_path)
     script_path = (
-        Path(__file__).resolve().parents[1]
-        / "skills"
-        / "handoff"
-        / "scripts"
-        / "handoff_client.py"
+        Path(__file__).resolve().parents[1] / "skills" / "handoff" / "scripts" / "handoff_client.py"
     )
     spec = importlib.util.spec_from_file_location("portable_handoff_client", script_path)
     assert spec and spec.loader
@@ -403,7 +403,7 @@ def test_portable_handoff_client_rejects_oversized_unpushed_patch(
     spec.loader.exec_module(mod)
 
     monkeypatch.setenv("AGY_HANDOFF_MAX_PATCH_BYTES", "10")
-    with pytest.raises(RuntimeError, match="git push -u origin burn_down_xfails"):
+    with pytest.raises(RuntimeError, match="--retry --push-branch burn_down_xfails"):
         mod.push_handoff(
             laptop,
             base_url="http://localhost:8080",
@@ -413,3 +413,5 @@ def test_portable_handoff_client_rejects_oversized_unpushed_patch(
             prompt="Continue work",
             github_repo="lodbrok-app/rattlsnek",
         )
+    pending_file = laptop / ".git" / "agy_handoff_pending.json"
+    assert pending_file.is_file()

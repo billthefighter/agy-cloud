@@ -140,6 +140,10 @@ class WorkerTimeoutError(TimeoutError):
         self.conversation_id = conversation_id
 
 
+class WorkerStallError(WorkerTimeoutError):
+    """Raised when a worker turn stalls with no streamed activity for the idle timeout."""
+
+
 def _capture_git_diff(work_dir: Path) -> tuple[str, str]:
     # Track new untracked source files with intent-to-add so `git diff HEAD` includes them,
     # while respecting the target repo's .gitignore and excluding Python bytecode / pytest
@@ -416,6 +420,7 @@ async def _run_agy_cli_worker(
     turn: int,
     existing_conv_id: str | None,
     timeout_seconds: int,
+    idle_timeout_seconds: int | None = None,
     issue_id: str = "",
     artifacts_dir: Path | None = None,
     venv_dir: Path | None = None,
@@ -423,6 +428,11 @@ async def _run_agy_cli_worker(
     """Execute a worker turn via the authenticated `agy` CLI (Google account subscription)."""
     cli_bin = os.environ.get("AGY_CLI_BIN", "agy").strip() or "agy"
     cli_model = resolve_worker_model_for_cli(worker_model)
+    effective_idle_timeout = (
+        int(idle_timeout_seconds)
+        if idle_timeout_seconds is not None
+        else int(os.environ.get("WORKER_IDLE_TIMEOUT_SECONDS", "900"))
+    )
 
     full_prompt = (
         f"<system_instructions>\n{effective_instructions}\n</system_instructions>\n\n{prompt}"
@@ -480,12 +490,50 @@ async def _run_agy_cli_worker(
             nonlocal result_payload, streamed_conv_id
             assert proc.stdout is not None
             assert proc.stderr is not None
+            loop = asyncio.get_running_loop()
+            hard_deadline = loop.time() + float(timeout_seconds)
+            last_activity = loop.time()
             stderr_task = asyncio.create_task(proc.stderr.read())
             try:
                 while True:
-                    raw_line = await proc.stdout.readline()
+                    now = loop.time()
+                    remaining_hard = hard_deadline - now
+                    if remaining_hard <= 0:
+                        raise WorkerTimeoutError(
+                            f"agy CLI timed out after {timeout_seconds}s",
+                            conversation_id=streamed_conv_id or existing_conv_id or "",
+                        )
+                    if effective_idle_timeout > 0:
+                        remaining_idle = (last_activity + float(effective_idle_timeout)) - now
+                        if remaining_idle <= 0:
+                            raise WorkerStallError(
+                                f"agy CLI stalled with no activity for {effective_idle_timeout}s",
+                                conversation_id=streamed_conv_id or existing_conv_id or "",
+                            )
+                        step_timeout = min(remaining_hard, remaining_idle)
+                        idle_first = remaining_idle < remaining_hard
+                    else:
+                        step_timeout = remaining_hard
+                        idle_first = False
+
+                    try:
+                        raw_line = await asyncio.wait_for(
+                            proc.stdout.readline(), timeout=step_timeout
+                        )
+                    except TimeoutError as exc:
+                        if idle_first and loop.time() < hard_deadline:
+                            raise WorkerStallError(
+                                f"agy CLI stalled with no activity for {effective_idle_timeout}s",
+                                conversation_id=streamed_conv_id or existing_conv_id or "",
+                            ) from exc
+                        raise WorkerTimeoutError(
+                            f"agy CLI timed out after {timeout_seconds}s",
+                            conversation_id=streamed_conv_id or existing_conv_id or "",
+                        ) from exc
+
                     if not raw_line:
                         break
+                    last_activity = loop.time()
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line:
                         continue
@@ -544,8 +592,11 @@ async def _run_agy_cli_worker(
                         res = event_obj.get("result")
                         if isinstance(res, dict):
                             result_payload = res
-                await proc.wait()
-                return await stderr_task
+                remaining_exit = max(0.1, hard_deadline - loop.time())
+                await asyncio.wait_for(proc.wait(), timeout=remaining_exit)
+                return await asyncio.wait_for(
+                    stderr_task, timeout=max(0.1, hard_deadline - loop.time())
+                )
             except BaseException:
                 stderr_task.cancel()
                 with contextlib.suppress(BaseException):
@@ -553,11 +604,13 @@ async def _run_agy_cli_worker(
                 raise
 
         try:
-            stderr_b = await asyncio.wait_for(_consume_stream(), timeout=timeout_seconds)
+            stderr_b = await _consume_stream()
         except TimeoutError as exc:
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
             await proc.wait()
+            if isinstance(exc, WorkerTimeoutError):
+                raise
             raise WorkerTimeoutError(
                 f"agy CLI timed out after {timeout_seconds}s",
                 conversation_id=streamed_conv_id or existing_conv_id or "",
@@ -705,6 +758,7 @@ async def run_worker() -> None:
         )
 
     timeout_seconds = int(os.environ.get("WORKER_TIMEOUT_SECONDS", "1620"))
+    idle_timeout_seconds = int(os.environ.get("WORKER_IDLE_TIMEOUT_SECONDS", "900"))
     log.info(
         "worker.starting",
         issue_id=issue_id,
@@ -713,6 +767,7 @@ async def run_worker() -> None:
         model=worker_model,
         worker_backend=worker_backend,
         timeout_seconds=timeout_seconds,
+        idle_timeout_seconds=idle_timeout_seconds,
         project_venv=str(project_venv) if project_venv is not None else "",
     )
     report: TriageReport | None = None
@@ -736,6 +791,7 @@ async def run_worker() -> None:
                 turn=turn,
                 existing_conv_id=existing_conv_id,
                 timeout_seconds=timeout_seconds,
+                idle_timeout_seconds=idle_timeout_seconds,
                 issue_id=issue_id,
                 artifacts_dir=artifacts_dir,
                 venv_dir=project_venv,
@@ -795,7 +851,12 @@ async def run_worker() -> None:
                     partial_patch_stats = diff_stats
             except Exception:  # noqa: BLE001
                 log.warning("worker.partial_diff_capture_failed", issue_id=issue_id, turn=turn)
-        err_name = "TimeoutError" if isinstance(exc, TimeoutError) else type(exc).__name__
+        if isinstance(exc, WorkerStallError):
+            err_name = "WorkerStallError"
+        elif isinstance(exc, TimeoutError):
+            err_name = "TimeoutError"
+        else:
+            err_name = type(exc).__name__
         err_detail = f"{err_name}: {exc}".rstrip(": ")
         log.exception("worker.failed", issue_id=issue_id, turn=turn, error=err_detail)
         envelope = WorkerEnvelope(

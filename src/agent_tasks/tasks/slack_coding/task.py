@@ -55,6 +55,7 @@ def _build_task_prompt(
     had_base_patch: bool = False,
     has_repo_snapshot: bool = False,
     source_conversation_id: str = "",
+    context_files: list[str] | None = None,
 ) -> str:
     """Build `/state/artifacts/<issue_id>/task_prompt.md` instructions for the worker pod."""
     safe_user = html.escape(user, quote=True)
@@ -85,6 +86,18 @@ def _build_task_prompt(
             "session have ALREADY been applied to `/work` via `fix.patch`. Run `git status` and "
             "`git diff HEAD` first to inspect the in-progress work before making further edits."
         )
+    if context_files:
+        lines.extend(
+            [
+                "",
+                "## Attached Context Files",
+                "",
+                "The following read-only reference files were attached to this handoff outside "
+                "`/work` so they do not dirty the repository. Read them directly as needed:",
+            ]
+        )
+        for cname in context_files:
+            lines.append(f"- `/artifacts/context/{cname}`")
 
     verify_step = (
         f"3. Run verification commands in `/work` (`{verify_hint}` and relevant tests) "
@@ -145,6 +158,22 @@ class SlackCodingTask:
         self.state = state
         self._heartbeat_cb = heartbeat_cb
         self._dispatch_callback = dispatch_callback
+        self._background_tasks: set[asyncio.Task[None]] = set()
+
+    def _schedule_dispatch_async(self) -> None:
+        if self._dispatch_callback is None:
+            return
+        callback = self._dispatch_callback
+
+        async def _run_dispatch() -> None:
+            try:
+                await callback()
+            except Exception:
+                log.exception("slack_coding.async_dispatch_failed")
+
+        task = asyncio.create_task(_run_dispatch())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     def artifact_dir(self, issue_id: str) -> Path:
         path = self.settings.state_dir / "artifacts" / issue_id
@@ -168,6 +197,7 @@ class SlackCodingTask:
         user: str,
         thread_ts: str,
         channel_id: str,
+        async_dispatch: bool = False,
     ) -> str:
         """Validate, enqueue (or queue revision for) an on-demand Slack coding request."""
         targets = self.load_targets()
@@ -208,7 +238,10 @@ class SlackCodingTask:
                 cleaned_prompt, encoding="utf-8"
             )
             if self._dispatch_callback is not None:
-                await self._dispatch_callback()
+                if async_dispatch:
+                    self._schedule_dispatch_async()
+                else:
+                    await self._dispatch_callback()
 
             model_label = updated.model_override or self.settings.worker_model
             log.info(
@@ -267,6 +300,12 @@ class SlackCodingTask:
             or (art_dir / "repo_snapshot.tar.gz").is_file()
         )
         source_conv_id = str(handoff_meta.get("source_conversation_id") or "").strip()
+        raw_ctx_files = handoff_meta.get("context_files")
+        context_files = (
+            [str(name).strip() for name in raw_ctx_files if str(name).strip()]
+            if isinstance(raw_ctx_files, list)
+            else []
+        )
 
         (art_dir / "task_prompt.md").write_text(
             _build_task_prompt(
@@ -281,6 +320,7 @@ class SlackCodingTask:
                 had_base_patch=had_base_patch,
                 has_repo_snapshot=has_repo_snapshot,
                 source_conversation_id=source_conv_id,
+                context_files=context_files,
             ),
             encoding="utf-8",
         )
@@ -308,7 +348,11 @@ class SlackCodingTask:
             return f"A coding task already exists for `{issue_id}`."
 
         if self._dispatch_callback is not None:
-            await self._dispatch_callback()
+            use_async_dispatch = async_dispatch or bool(handoff_meta.get("async_dispatch"))
+            if use_async_dispatch:
+                self._schedule_dispatch_async()
+            else:
+                await self._dispatch_callback()
 
         model_label = effective_model_override or self.settings.worker_model
         log.info(

@@ -432,6 +432,10 @@ class ControllerSettings(pydantic.BaseModel):
     worker_secret_name: str = "agent-tasks-worker-secret"
     image_pull_secret_name: str = "ghcr-pull"
     job_active_deadline_seconds: int = 1800
+    handoff_active_deadline_seconds: int = 7200
+    handoff_max_deadline_seconds: int = 14400
+    worker_idle_timeout_seconds: int = 900
+    max_handoff_auto_continues: int = 2
     job_ttl_seconds_after_finished: int = 1800
     max_concurrent_jobs: int = 2
 
@@ -504,6 +508,14 @@ class ControllerSettings(pydantic.BaseModel):
             worker_secret_name=os.environ.get("WORKER_SECRET_NAME", "agent-tasks-worker-secret"),
             image_pull_secret_name=os.environ.get("IMAGE_PULL_SECRET_NAME", "ghcr-pull"),
             job_active_deadline_seconds=int(os.environ.get("JOB_ACTIVE_DEADLINE_SECONDS", "1800")),
+            handoff_active_deadline_seconds=int(
+                os.environ.get("HANDOFF_ACTIVE_DEADLINE_SECONDS", "7200")
+            ),
+            handoff_max_deadline_seconds=int(
+                os.environ.get("HANDOFF_MAX_DEADLINE_SECONDS", "14400")
+            ),
+            worker_idle_timeout_seconds=int(os.environ.get("WORKER_IDLE_TIMEOUT_SECONDS", "900")),
+            max_handoff_auto_continues=int(os.environ.get("MAX_HANDOFF_AUTO_CONTINUES", "2")),
             job_ttl_seconds_after_finished=int(
                 os.environ.get("JOB_TTL_SECONDS_AFTER_FINISHED", "1800")
             ),

@@ -624,8 +624,22 @@ def test_k8s_job_manifest_wires_worker_timeout_and_dontwritebytecode() -> None:
     worker = job.spec.template.spec.containers[0]
     env_map = {e.name: e.value for e in worker.env}
     assert job.spec.active_deadline_seconds == 3600
-    assert env_map["WORKER_TIMEOUT_SECONDS"] == "3420"
+    assert env_map["WORKER_TIMEOUT_SECONDS"] == "3300"
+    assert env_map["WORKER_IDLE_TIMEOUT_SECONDS"] == "900"
     assert env_map["PYTHONDONTWRITEBYTECODE"] == "1"
+
+    short_job = build_triage_job_manifest(
+        settings=settings,
+        record=record,
+        target=target,
+        worker_backend="agy_cli",
+        active_deadline_seconds=1200,
+        worker_idle_timeout_seconds=450,
+    )
+    short_env = {e.name: e.value for e in short_job.spec.template.spec.containers[0].env}
+    assert short_job.spec.active_deadline_seconds == 1200
+    assert short_env["WORKER_TIMEOUT_SECONDS"] == "1020"
+    assert short_env["WORKER_IDLE_TIMEOUT_SECONDS"] == "450"
 
 
 @pytest.mark.asyncio
@@ -753,3 +767,234 @@ def test_migration_syncs_existing_handoff_status_and_ignores_unchanged_initial_p
     assert synced.remote_conversation_id == "conv-resumable"
     assert synced.last_error == "TimeoutError: agy CLI timed out after 1620s"
     assert synced.has_result_patch is False
+
+
+def test_controller_settings_handoff_timeout_defaults_and_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    defaults = ControllerSettings(target_github_token="ghp_test")
+    assert defaults.job_active_deadline_seconds == 1800
+    assert defaults.handoff_active_deadline_seconds == 7200
+    assert defaults.handoff_max_deadline_seconds == 14400
+    assert defaults.worker_idle_timeout_seconds == 900
+    assert defaults.max_handoff_auto_continues == 2
+
+    monkeypatch.setenv("SLACK_ENABLED", "false")
+    monkeypatch.setenv("TARGET_GITHUB_TOKEN", "ghp_test")
+    monkeypatch.setenv("HANDOFF_ACTIVE_DEADLINE_SECONDS", "5400")
+    monkeypatch.setenv("HANDOFF_MAX_DEADLINE_SECONDS", "10800")
+    monkeypatch.setenv("WORKER_IDLE_TIMEOUT_SECONDS", "600")
+    monkeypatch.setenv("MAX_HANDOFF_AUTO_CONTINUES", "3")
+    loaded = ControllerSettings.from_env()
+    assert loaded.handoff_active_deadline_seconds == 5400
+    assert loaded.handoff_max_deadline_seconds == 10800
+    assert loaded.worker_idle_timeout_seconds == 600
+    assert loaded.max_handoff_auto_continues == 3
+
+
+@pytest.mark.asyncio
+async def test_agy_cli_worker_idle_stall_raises_worker_stall_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inactivity timeout kills the stalled process and raises WorkerStallError."""
+    import stat
+
+    from agent_tasks.worker_main import WorkerStallError, _run_agy_cli_worker
+
+    fake_cli = tmp_path / "fake-agy-stall"
+    fake_cli.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, time\n"
+        'print(json.dumps({"event": "init", "conversation_id": "conv-stalled-1"}), flush=True)\n'
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    fake_cli.chmod(fake_cli.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("AGY_CLI_BIN", str(fake_cli))
+
+    with pytest.raises(WorkerStallError, match="stalled with no activity for 1s") as exc_info:
+        await _run_agy_cli_worker(
+            prompt="Do work",
+            effective_instructions="sys",
+            worker_model="gemini-4-hydrogen",
+            work_dir=tmp_path,
+            turn=1,
+            existing_conv_id=None,
+            timeout_seconds=10,
+            idle_timeout_seconds=1,
+            issue_id="slack-stall",
+            artifacts_dir=tmp_path,
+        )
+    assert exc_info.value.conversation_id == "conv-stalled-1"
+
+
+@pytest.mark.asyncio
+async def test_agy_cli_worker_active_stream_hits_wall_clock_not_stall(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Continuous NDJSON activity resets the idle timer until the wall-clock ceiling fires."""
+    import stat
+
+    from agent_tasks.worker_main import WorkerStallError, WorkerTimeoutError, _run_agy_cli_worker
+
+    fake_cli = tmp_path / "fake-agy-active"
+    fake_cli.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, time\n"
+        'print(json.dumps({"event": "init", "conversation_id": "conv-active-1"}), flush=True)\n'
+        "for i in range(20):\n"
+        "    time.sleep(0.3)\n"
+        '    print(json.dumps({"event": "step_update", "step_update": {"step_index": i, "step_type": "tool", "state": "RUNNING", "text_delta": "."}}), flush=True)\n',
+        encoding="utf-8",
+    )
+    fake_cli.chmod(fake_cli.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("AGY_CLI_BIN", str(fake_cli))
+
+    with pytest.raises(WorkerTimeoutError, match="timed out after 2s") as exc_info:
+        await _run_agy_cli_worker(
+            prompt="Long active work",
+            effective_instructions="sys",
+            worker_model="gemini-4-hydrogen",
+            work_dir=tmp_path,
+            turn=1,
+            existing_conv_id=None,
+            timeout_seconds=2,
+            idle_timeout_seconds=1,
+            issue_id="slack-active",
+            artifacts_dir=tmp_path,
+        )
+    assert not isinstance(exc_info.value, WorkerStallError)
+    assert exc_info.value.conversation_id == "conv-active-1"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_handoff_deadlines_and_auto_continue_on_productive_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Handoffs use handoff_active_deadline_seconds (or clamped timeout_seconds), auto-continue
+    on productive wall-clock timeout up to cap, and fail immediately on WorkerStallError."""
+    import json
+    from unittest.mock import AsyncMock, MagicMock
+
+    from agent_tasks.common.state import StateStore
+    from agent_tasks.tasks.sentry_triage.orchestrator import SentryTriageTask
+
+    state = StateStore(tmp_path / "state.sqlite3")
+    targets_yaml = tmp_path / "targets.yaml"
+    targets_yaml.write_text("slack_coding:\n  enabled: true\n", encoding="utf-8")
+    settings = ControllerSettings(
+        state_dir=tmp_path,
+        targets_config_path=targets_yaml,
+        target_github_token="ghp_test",
+        handoff_active_deadline_seconds=7200,
+        handoff_max_deadline_seconds=14400,
+        worker_idle_timeout_seconds=900,
+        max_handoff_auto_continues=2,
+    )
+    channel = MagicMock()
+    channel.resolve_channel_for_task.return_value = "C_CODE"
+    channel.post_thread_message = AsyncMock(return_value="ts-1")
+
+    spawned_calls: list[dict[str, object]] = []
+
+    class _FakeRunner:
+        async def spawn_job(
+            self,
+            record,
+            target,
+            *,
+            worker_backend="sdk",
+            use_repo_snapshot=False,
+            active_deadline_seconds=None,
+            worker_idle_timeout_seconds=None,
+        ):
+            spawned_calls.append(
+                {
+                    "issue_id": record.issue_id,
+                    "turn": record.turn,
+                    "active_deadline_seconds": active_deadline_seconds,
+                    "worker_idle_timeout_seconds": worker_idle_timeout_seconds,
+                }
+            )
+            return f"job-{record.issue_id}-t{record.turn}"
+
+        async def get_job_terminal_state(self, issue_id: str, turn: int) -> str | None:
+            return "failed"
+
+    monkeypatch.setattr(
+        "agent_tasks.tasks.sentry_triage.orchestrator.sync_bare_mirror",
+        AsyncMock(return_value=tmp_path / "mirror.git"),
+    )
+
+    orch = SentryTriageTask(
+        settings=settings,
+        state=state,
+        channel=channel,
+        job_runner=_FakeRunner(),  # type: ignore[arg-type]
+        heartbeat_cb=lambda: None,
+    )
+
+    # 1. Dispatch respects custom clamped timeout_seconds from handoff_meta.json
+    rec = state.register_if_new(
+        issue_id="slack-auto-1",
+        short_id="HANDOFF-AUTO1",
+        project_slug="agy-cloud",
+        github_repo="billthefighter/agy-cloud",
+        default_branch="main",
+        title="Big refactor",
+        permalink="",
+        task_kind="slack_coding",
+        thread_ts="1795000.1",
+        channel_id="C_CODE",
+    )
+    assert rec is not None
+    art_dir = tmp_path / "artifacts" / rec.issue_id
+    art_dir.mkdir(parents=True, exist_ok=True)
+    (art_dir / "handoff_meta.json").write_text(
+        json.dumps({"is_handoff": True, "timeout_seconds": 99999}), encoding="utf-8"
+    )
+    await orch.dispatch_pending()
+    assert len(spawned_calls) == 1
+    assert spawned_calls[0]["active_deadline_seconds"] == 14400  # clamped to max
+    assert spawned_calls[0]["worker_idle_timeout_seconds"] == 900
+
+    # 2. Productive wall-clock timeout -> auto-continues to turn 2 (NOT FAILED)
+    (art_dir / "result.json").write_text(
+        WorkerEnvelope(
+            issue_id=rec.issue_id,
+            turn=1,
+            conversation_id="conv-resume-1",
+            model="gemini-4-hydrogen",
+            worker_backend="agy_cli",
+            error="TimeoutError: agy CLI timed out after 14100s",
+        ).model_dump_json(),
+        encoding="utf-8",
+    )
+    await orch._reconcile_running_jobs()
+    after_t1 = state.get_by_issue_id(rec.issue_id)
+    assert after_t1 is not None
+    assert after_t1.turn == 2
+    assert after_t1.status == IssueStatus.RUNNING  # bumped to QUEUED and dispatched!
+    assert after_t1.conversation_id == "conv-resume-1"
+    assert (art_dir / "feedback-turn-2.txt").is_file()
+    meta_after = json.loads((art_dir / "handoff_meta.json").read_text(encoding="utf-8"))
+    assert meta_after["auto_continue_count"] == 1
+
+    # 3. WorkerStallError on turn 2 -> does NOT auto-continue, marks FAILED immediately
+    (art_dir / "result.json").write_text(
+        WorkerEnvelope(
+            issue_id=rec.issue_id,
+            turn=2,
+            conversation_id="conv-resume-1",
+            model="gemini-4-hydrogen",
+            worker_backend="agy_cli",
+            error="WorkerStallError: agy CLI stalled with no activity for 900s",
+        ).model_dump_json(),
+        encoding="utf-8",
+    )
+    await orch._reconcile_running_jobs()
+    after_stall = state.get_by_issue_id(rec.issue_id)
+    assert after_stall is not None
+    assert after_stall.status == IssueStatus.FAILED
+    assert after_stall.turn == 2
+    assert after_stall.last_error and "stalled" in after_stall.last_error

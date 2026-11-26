@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 from datetime import UTC, datetime
@@ -7,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 from pywebpush import WebPushException
@@ -1469,3 +1471,157 @@ async def test_coding_proposal_emits_reject_button_and_reject_action_marks_rejec
         assert body["thread"]["status"] == "rejected"
         assert state.get_by_issue_id(rec.issue_id).status == IssueStatus.REJECTED
         assert any("Rejected proposal" in m["body_md"] for m in body["messages"])
+
+
+def test_handoff_context_files_idempotency_timeout_and_repo_access_limits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agent_tasks.tasks.slack_coding import SlackCodingTask
+
+    settings, state, _push_mgr, gateway, _composite, app, _actions = _make_stack(tmp_path)
+    dispatch_calls: list[str] = []
+
+    async def fake_dispatch() -> None:
+        dispatch_calls.append("called")
+
+    coding_task = SlackCodingTask(
+        settings=settings,
+        state=state,
+        dispatch_callback=fake_dispatch,
+    )
+    gateway.on_coding_request = lambda prompt, user, ts, chan: coding_task.handle_coding_request(
+        prompt_text=prompt,
+        user=user,
+        thread_ts=ts,
+        channel_id=chan,
+    )
+
+    with TestClient(app) as client:
+        headers = {"Authorization": "Bearer super-secret-pwa-token"}
+
+        # 1. Context files materialized with sanitized basenames + timeout clamped + Idempotency-Key
+        r1 = client.post(
+            "/agy/api/handoff",
+            headers={**headers, "Idempotency-Key": "idem-abc-123"},
+            json={
+                "github_repo": "billthefighter/agy-cloud",
+                "base_branch": "main",
+                "prompt": "Implement redesign",
+                "timeout_seconds": 99999,
+                "context_files": [
+                    {"name": "../../etc/plan.md", "content": "# Plan\nStep 1"},
+                    {"name": "dir/plan.md", "content": "# Second plan"},
+                ],
+            },
+        )
+        assert r1.status_code == 200
+        d1 = r1.json()
+        assert d1["ok"] is True
+        assert d1.get("deduplicated") is not True
+        assert d1["timeout_seconds"] == settings.handoff_max_deadline_seconds
+        assert d1["context_files"] == ["plan.md", "plan_2.md"]
+        assert d1["idempotency_key"] == "idem-abc-123"
+
+        art_dir = settings.state_dir / "artifacts" / d1["issue_id"]
+        assert (art_dir / "context" / "plan.md").read_text(encoding="utf-8") == "# Plan\nStep 1"
+        assert (art_dir / "context" / "plan_2.md").read_text(encoding="utf-8") == "# Second plan"
+        prompt_md = (art_dir / "task_prompt.md").read_text(encoding="utf-8")
+        assert "/artifacts/context/plan.md" in prompt_md
+        assert "/artifacts/context/plan_2.md" in prompt_md
+        meta = json.loads((art_dir / "handoff_meta.json").read_text(encoding="utf-8"))
+        assert meta["timeout_seconds"] == settings.handoff_max_deadline_seconds
+        assert meta["idempotency_key"] == "idem-abc-123"
+
+        # 2. Duplicate POST with same Idempotency-Key returns same handoff with deduplicated=True
+        r2 = client.post(
+            "/agy/api/handoff",
+            headers={**headers, "Idempotency-Key": "idem-abc-123"},
+            json={
+                "github_repo": "billthefighter/agy-cloud",
+                "base_branch": "main",
+                "prompt": "Implement redesign",
+            },
+        )
+        assert r2.status_code == 200
+        d2 = r2.json()
+        assert d2["deduplicated"] is True
+        assert d2["handoff_id"] == d1["handoff_id"]
+
+        # 3. Minimum timeout clamp (300s) and oversized context file rejection (413)
+        r_min = client.post(
+            "/agy/api/handoff",
+            headers=headers,
+            json={
+                "github_repo": "billthefighter/agy-cloud",
+                "prompt": "Quick fix",
+                "timeout_seconds": 10,
+            },
+        )
+        assert r_min.status_code == 200
+        assert r_min.json()["timeout_seconds"] == 300
+
+        r_big = client.post(
+            "/agy/api/handoff",
+            headers=headers,
+            json={
+                "github_repo": "billthefighter/agy-cloud",
+                "prompt": "Too big context",
+                "context_files": [{"name": "huge.txt", "content": "x" * (600 * 1024)}],
+            },
+        )
+        assert r_big.status_code == 413
+
+        # 4. GET /api/handoff/repo-access advertises limits and default timeout
+        monkeypatch.setattr(
+            "agent_tasks.pwa.gateway.check_github_repo_access",
+            AsyncMock(return_value=(True, True, "")),
+        )
+        r_acc = client.get(
+            "/agy/api/handoff/repo-access?repo=billthefighter/agy-cloud",
+            headers=headers,
+        )
+        assert r_acc.status_code == 200
+        acc_json = r_acc.json()
+        assert acc_json["accessible"] is True
+        assert acc_json["max_patch_bytes"] == 5 * 1024 * 1024
+        assert acc_json["max_snapshot_bytes"] == 25 * 1024 * 1024
+        assert (
+            acc_json["default_handoff_timeout_seconds"] == settings.handoff_active_deadline_seconds
+        )
+
+
+def test_handoff_post_does_not_block_on_slow_dispatch(tmp_path: Path) -> None:
+    import time
+
+    from agent_tasks.tasks.slack_coding import SlackCodingTask
+
+    settings, state, _push_mgr, gateway, _composite, app, _actions = _make_stack(tmp_path)
+
+    async def very_slow_dispatch() -> None:
+        await asyncio.sleep(5.0)
+
+    coding_task = SlackCodingTask(
+        settings=settings,
+        state=state,
+        dispatch_callback=very_slow_dispatch,
+    )
+    gateway.on_coding_request = lambda prompt, user, ts, chan: coding_task.handle_coding_request(
+        prompt_text=prompt,
+        user=user,
+        thread_ts=ts,
+        channel_id=chan,
+    )
+
+    with TestClient(app) as client:
+        t0 = time.monotonic()
+        resp = client.post(
+            "/agy/api/handoff",
+            headers={"Authorization": "Bearer super-secret-pwa-token"},
+            json={
+                "github_repo": "billthefighter/agy-cloud",
+                "prompt": "Fast async launch",
+            },
+        )
+        elapsed = time.monotonic() - t0
+        assert resp.status_code == 200
+        assert elapsed < 2.0

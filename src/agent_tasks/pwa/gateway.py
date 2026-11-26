@@ -4,6 +4,8 @@ import asyncio
 import hashlib
 import io
 import json
+import os
+import re
 import secrets
 import time
 from dataclasses import asdict
@@ -29,7 +31,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from PIL import Image, ImageDraw
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from agent_tasks.channels.base import (
     ApproveCallback,
@@ -58,6 +60,7 @@ from agent_tasks.pwa.push import DEFAULT_PUSH_PREFS, WebPushManager
 from agent_tasks.tasks.billing_guard.pricing import compute_billing_cycle
 from agent_tasks.tasks.direct_chat import DirectChatService
 from agent_tasks.tasks.sentry_triage.git_ops import (
+    DEFAULT_MAX_REPO_SNAPSHOT_BYTES,
     RepoSnapshotTooLargeError,
     check_github_repo_access,
     validate_and_write_repo_snapshot,
@@ -232,6 +235,71 @@ class _CodingRequest(BaseModel):
     model: str = ""
 
 
+DEFAULT_MAX_INLINE_PATCH_BYTES = 5 * 1024 * 1024  # 5 MiB
+MAX_CONTEXT_FILES = 20
+MAX_CONTEXT_FILE_BYTES = 512 * 1024  # 512 KiB per context file
+MAX_TOTAL_CONTEXT_BYTES = 2 * 1024 * 1024  # 2 MiB total across context files
+
+
+class _ContextFilesTooLargeError(ValueError):
+    """Raised when uploaded context files exceed size limits."""
+
+
+class _HandoffContextFile(BaseModel):
+    name: str
+    content: str
+
+
+def _sanitize_context_filename(raw_name: str, index: int) -> str:
+    # Strip any POSIX or Windows path prefixes so traversal is impossible
+    leaf = raw_name.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", leaf).lstrip("._-")
+    if not cleaned:
+        cleaned = f"context_{index}.txt"
+    return cleaned[:120]
+
+
+def _materialize_context_files(
+    art_dir: Path, context_files: list[_HandoffContextFile]
+) -> list[str]:
+    if not context_files:
+        return []
+    if len(context_files) > MAX_CONTEXT_FILES:
+        raise ValueError(f"Too many context_files ({len(context_files)}; max {MAX_CONTEXT_FILES}).")
+    ctx_dir = art_dir / "context"
+    written_names: list[str] = []
+    used: set[str] = set()
+    total_bytes = 0
+    prepared: list[tuple[str, bytes]] = []
+    for idx, cf in enumerate(context_files, start=1):
+        base_name = _sanitize_context_filename(cf.name, idx)
+        candidate = base_name
+        stem, dot, ext = base_name.partition(".")
+        suffix_n = 2
+        while candidate in used:
+            candidate = f"{stem}_{suffix_n}.{ext}" if dot else f"{base_name}_{suffix_n}"
+            suffix_n += 1
+        used.add(candidate)
+        encoded = cf.content.encode("utf-8")
+        if len(encoded) > MAX_CONTEXT_FILE_BYTES:
+            raise _ContextFilesTooLargeError(
+                f"Context file `{candidate}` is {len(encoded)} bytes "
+                f"(exceeds {MAX_CONTEXT_FILE_BYTES} byte limit)."
+            )
+        total_bytes += len(encoded)
+        if total_bytes > MAX_TOTAL_CONTEXT_BYTES:
+            raise _ContextFilesTooLargeError(
+                f"Total context_files size exceeds {MAX_TOTAL_CONTEXT_BYTES} byte limit."
+            )
+        prepared.append((candidate, encoded))
+
+    ctx_dir.mkdir(parents=True, exist_ok=True)
+    for name, encoded in prepared:
+        (ctx_dir / name).write_bytes(encoded)
+        written_names.append(name)
+    return written_names
+
+
 class _HandoffCreateRequest(BaseModel):
     prompt: str
     repo: str = ""
@@ -242,6 +310,7 @@ class _HandoffCreateRequest(BaseModel):
     base_patch: str = ""
     patch: str = ""
     repo_snapshot_b64: str = ""
+    context_files: list[_HandoffContextFile] = Field(default_factory=list)
     semantic_state: str = ""
     verify_hint: str = ""
     focus_subdir: str = ""
@@ -251,6 +320,8 @@ class _HandoffCreateRequest(BaseModel):
     source_conversation_id: str = ""
     local_conversation_id: str | None = None
     workspace_path: str = ""
+    timeout_seconds: int | None = None
+    idempotency_key: str = ""
 
 
 class _HandoffFeedbackRequest(BaseModel):
@@ -666,6 +737,9 @@ class PwaGatewayAdapter:
             "affected_files": record.affected_files,
             "report": report_dict,
             "usage": usage_dict,
+            "idempotency_key": str(meta.get("idempotency_key") or ""),
+            "timeout_seconds": meta.get("timeout_seconds"),
+            "context_files": list(meta.get("context_files") or []),
         }
         if include_diff:
             payload["diff"] = diff_text
@@ -1673,12 +1747,41 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
         return {"thread": gateway._serialize_thread(fresh), "ack": ack}
 
     @router.post("/api/handoff", dependencies=[Depends(_require_auth)])
-    async def create_handoff(body: _HandoffCreateRequest) -> dict[str, Any]:
+    async def create_handoff(
+        body: _HandoffCreateRequest,
+        request: Request,
+    ) -> dict[str, Any]:
         if gateway.on_coding_request is None:
             raise HTTPException(status_code=503, detail="Coding task handler is not enabled.")
         prompt = body.prompt.strip()
         if not prompt:
             raise HTTPException(status_code=400, detail="Handoff prompt cannot be empty.")
+
+        idem_key = (request.headers.get("Idempotency-Key") or body.idempotency_key or "").strip()
+        if idem_key:
+            recent = gateway.state.list_recent_issues(
+                task_kind="slack_coding",
+                short_id_prefix="HANDOFF-",
+                limit=25,
+            )
+            for rec in recent:
+                if rec.status not in {IssueStatus.QUEUED, IssueStatus.RUNNING}:
+                    continue
+                rec_meta_path = (
+                    gateway.settings.state_dir / "artifacts" / rec.issue_id / "handoff_meta.json"
+                )
+                if not rec_meta_path.is_file():
+                    continue
+                try:
+                    rec_meta = json.loads(rec_meta_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if isinstance(rec_meta, dict) and rec_meta.get("idempotency_key") == idem_key:
+                    dedup_result = gateway._build_handoff_payload(rec, include_diff=False)
+                    dedup_result["ok"] = True
+                    dedup_result["deduplicated"] = True
+                    return dedup_result
+
         semantic_state = body.semantic_state.strip()
         if semantic_state and semantic_state not in prompt:
             prompt = f"{prompt}\n\n## Semantic State\n{semantic_state}"
@@ -1698,6 +1801,11 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
         had_base_patch = bool(base_patch.strip())
         source_conversation_id = (
             body.source_conversation_id.strip() or (body.local_conversation_id or "").strip()
+        )
+        effective_timeout_seconds = (
+            max(300, min(int(body.timeout_seconds), gateway.settings.handoff_max_deadline_seconds))
+            if body.timeout_seconds is not None
+            else gateway.settings.handoff_active_deadline_seconds
         )
 
         tokens: list[str] = []
@@ -1754,14 +1862,27 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             has_repo_snapshot = True
 
+        materialized_context_files: list[str] = []
+        if body.context_files:
+            try:
+                materialized_context_files = _materialize_context_files(art_dir, body.context_files)
+            except _ContextFilesTooLargeError as exc:
+                raise HTTPException(status_code=413, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
         meta_payload = {
             "is_handoff": True,
+            "async_dispatch": True,
             "repo": repo,
             "branch": branch,
             "base_sha": base_sha,
             "had_base_patch": had_base_patch,
             "has_repo_snapshot": has_repo_snapshot,
             "repo_snapshot_bytes": repo_snapshot_bytes,
+            "context_files": materialized_context_files,
+            "timeout_seconds": effective_timeout_seconds,
+            "idempotency_key": idem_key,
             "verify_hint": body.verify_hint.strip(),
             "focus_subdir": body.focus_subdir.strip(),
             "model": selected_model or gateway.settings.worker_model,
@@ -1883,11 +2004,17 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
             clean_repo,
             token,
         )
+        max_patch_bytes = int(
+            os.environ.get("HANDOFF_MAX_PATCH_BYTES", str(DEFAULT_MAX_INLINE_PATCH_BYTES))
+        )
         return {
             "repo": clean_repo,
             "accessible": accessible,
             "has_mirror": has_mirror,
             "reason": reason,
+            "max_patch_bytes": max_patch_bytes,
+            "max_snapshot_bytes": DEFAULT_MAX_REPO_SNAPSHOT_BYTES,
+            "default_handoff_timeout_seconds": gateway.settings.handoff_active_deadline_seconds,
         }
 
     @router.get("/api/handoff/{handoff_id}", dependencies=[Depends(_require_auth)])

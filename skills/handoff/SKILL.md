@@ -7,34 +7,53 @@ description: Hand off the current Antigravity coding session and uncommitted wor
 
 Use this skill when the user invokes `/handoff` (or asks to hand off a task to their k3s cluster while driving / away from their laptop).
 
-## Subcommands & Modes
+## Fast-Launch Protocol (Read First)
 
-1. **`/handoff` or `/handoff <instructions>` (Default: Push + Poll-on-Wake Mode)**
-   - **What it does:**
-     1. Synthesize a compact Semantic State ($s_t$) of the current conversation (Goal, Completed Changes, Remaining Tasks, Verification Commands).
-     2. Run `handoff_client.py start` with `--prompt` and `--state`. This pushes the current git base SHA, branch, uncommitted working-tree diff (`git diff --binary HEAD`), and prompt to `POST /api/handoff` on the k3s cluster, and **immediately enters sleep-resilient polling mode**.
-     3. Use `WaitMsBeforeAsync=3000` on `run_command` so the push confirmation is captured immediately while the sleep-resilient poll loop continues in the background.
-     4. **Stop calling tools after launching the background poller.** While the laptop is asleep in the car, `handoff_client.py` ignores transient VPN/network drops. As soon as the laptop wakes and the remote k3s pod reaches a terminal state (`awaiting_review`, `completed`, or `failed`), the background task automatically applies the remote `fix.patch` to the local working tree, marks the handoff pulled, and exits — triggering **Reactive Wakeup** in this conversation so you can immediately summarize the pod's changes!
-   - **Model & Effort Selection (Default to Self):** Always pass `--model` matching **your own active model + effort tier** (e.g. `gemini-4-neon-medium`, `gemini-4-hydrogen-high`, `claude-sonnet-5-5-medium`) unless the user explicitly asks for another model or effort tier (in which case pass `--model <model>` and optionally `--effort <low|medium|high>`).
-   - **Command:**
+Follow this protocol on Turn 1 to launch in 2 tool calls with zero wasted exploration:
+
+1. **DO NOT read `handoff_client.py` source code** and **DO NOT run manual preflight probes** (`git ls-remote`, `git merge-base`, `wc -c`, or `transcript.jsonl` scans) — `handoff_client.py` already handles git ref probing, config URL resolution, model auto-detection, repo-access checks, and draft caching automatically.
+2. **Keep `--prompt` concise (5–15 lines).** Attach external plans, design docs, or large logs with repeatable `--context-file <path>` (or pass `--prompt-file <path>` / `--prompt -`). Context files are mounted read-only under `/artifacts/context/<name>` so they never dirty `/work`.
+3. **Omit `--model`** unless the user explicitly asks for another model — `handoff_client.py` auto-detects the active session model from Antigravity transcripts (falling back to `gemini-4-hydrogen`). Human names like `"Gemini 4 Neon (High)"` and shorthands (`neon`, `hydrogen`) also work when overriding.
+4. **Default Two-Step Flow:**
+   - **Step 1 (Synchronous push):** Run `handoff_client.py push` with `WaitMsBeforeAsync=10000` so you immediately get the `handoff_id` (or any preflight message):
      ```bash
-     python3 ~/.gemini/config/skills/handoff/scripts/handoff_client.py start \
+     python3 ~/.gemini/config/skills/handoff/scripts/handoff_client.py push \
        --workdir "<workspace_root>" \
-       --model "<your-active-model-id>" \
-       --effort "<low|medium|high>" \
-       --prompt "<remaining task instructions>" \
+       --prompt "<5-15 line task instructions>" \
+       --context-file "<optional/plan.md>" \
        --state "<compact semantic state s_t>" \
        --verify-hint "<pytest / linter command>"
      ```
-     *(Omit `--effort` if `--model` already includes the effort suffix, e.g. `gemini-4-neon-medium`.)*
-   - *(Note: If the user runs bare `/handoff` when an unpulled handoff is already active for this workspace and provides no new task instructions, omit `--prompt` so `handoff_client.py start` attaches directly to the active handoff in poll-on-wake mode.)*
+   - **Step 2 (Background watch):** Run `handoff_client.py watch --handoff-id <id>` with `WaitMsBeforeAsync=2000`, then **stop calling tools** to wait for Reactive Wakeup when the remote pod finishes (duplicate watchers exit `0` cleanly via a singleton lock):
+     ```bash
+     python3 ~/.gemini/config/skills/handoff/scripts/handoff_client.py watch \
+       --workdir "<workspace_root>" \
+       --handoff-id "<handoff_id>"
+     ```
+5. **On Preflight Failure — Always Use `--retry` (Never Rewrite the Prompt):** `push` caches raw inputs in `.git/agy_handoff_pending.json` before git/network preflight. If push fails (e.g. unpushed commits exceeding inline patch limit), re-run the printed single-line retry command with `--retry` (and `--push-branch <branch>` if instructed):
+   ```bash
+   python3 ~/.gemini/config/skills/handoff/scripts/handoff_client.py push \
+     --workdir "<workspace_root>" --retry --push-branch <branch>
+   ```
+
+## Subcommands & Modes
+
+1. **`/handoff` or `/handoff <instructions>` (Default: Two-Step Push + Background Watch)**
+   - Run **Step 1 (`push`)** synchronously (`WaitMsBeforeAsync=10000`), then **Step 2 (`watch --handoff-id <id>`)** in the background (`WaitMsBeforeAsync=2000`), and **stop calling tools** so Reactive Wakeup notifies you when the pod finishes and applies `fix.patch` locally.
+   - *(Optional single-command alternative: `handoff_client.py start` pushes and immediately enters sleep-resilient polling mode. If the user runs bare `/handoff` with an active unpulled handoff and no new instructions, omit `--prompt` so `start` attaches directly to the active handoff.)*
+   - **Optional Flags (`push` & `start`):**
+     - `--context-file <path>` (repeatable): Attach read-only UTF-8 files under `/artifacts/context/<name>` without dirtying `/work`.
+     - `--prompt-file <path>` or `--prompt -`: Read prompt from a file or stdin.
+     - `--timeout <seconds>`: Override default 2h worker wall-clock deadline (server clamps to `[300, 14400]`; productive wall-clock timeouts auto-continue).
+     - `--retry`: Reload cached draft from `.git/agy_handoff_pending.json` without rewriting prompt/context flags.
+     - `--push-branch [BRANCH]`: Push `HEAD` to `origin/<branch>` before git metadata detection.
+     - `--model <id|human-name|auto>` / `--effort <low|medium|high>`: Override auto-detected model.
 
 2. **`/handoff push <instructions>` (Push Only — No Local Poller)**
    - Pushes the session state and working-tree diff to the k3s cluster and returns immediately without starting a background poll task:
      ```bash
      python3 ~/.gemini/config/skills/handoff/scripts/handoff_client.py push \
        --workdir "<workspace_root>" \
-       --model "<your-active-model-id>" \
        --prompt "<remaining task instructions>" \
        --state "<compact semantic state s_t>" \
        --verify-hint "<pytest / linter command>"
@@ -49,7 +68,7 @@ Use this skill when the user invokes `/handoff` (or asks to hand off a task to t
      ```
 
 4. **`/handoff watch [<handoff_id>]` (Attach Poll-on-Wake to Existing Handoff)**
-   - Starts the sleep-resilient background poller for an existing remote handoff (run with `WaitMsBeforeAsync=2000` and stop calling tools to wait for Reactive Wakeup):
+   - Starts the sleep-resilient background poller for an existing remote handoff (run with `WaitMsBeforeAsync=2000` and stop calling tools to wait for Reactive Wakeup). Protected by a per-handoff `flock` lock so duplicate watchers exit `0` cleanly:
      ```bash
      python3 ~/.gemini/config/skills/handoff/scripts/handoff_client.py watch \
        --workdir "<workspace_root>" \
@@ -74,6 +93,6 @@ Use this skill when the user invokes `/handoff` (or asks to hand off a task to t
 
 `handoff_client.py` resolves connection settings automatically in priority order:
 1. CLI flags (`--url`, `--token`, `--ca-cert`, `--insecure`)
-2. Environment variables (`AGY_HANDOFF_URL`, `AGY_HANDOFF_TOKEN`, `PWA_API_TOKEN`)
-3. Workspace (and parent directory) `.agy-handoff.env`, `.env`, or `.env.makesense`
-4. User config `~/.config/agy-cloud/config.env`
+2. Explicit `AGY_HANDOFF_URL` / `AGY_CLOUD_URL` across environment variables, workspace/parent `.agy-handoff.env` / `.env` / `.env.makesense`, and `~/.config/agy-cloud/config.env`
+3. Fallback `NETBIRD_HOSTNAME` from workspace/parent `.env` files (only if no explicit URL was found in any layer)
+4. Nonexistent `AGY_HANDOFF_CA_CERT` paths are ignored automatically
