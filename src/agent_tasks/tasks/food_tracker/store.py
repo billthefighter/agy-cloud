@@ -306,6 +306,19 @@ class NutritionStore:
                 );
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS garmin_settings_history (
+                    effective_date TEXT PRIMARY KEY,
+                    dynamic_enabled INTEGER NOT NULL,
+                    goal_delta_kcal INTEGER NOT NULL,
+                    active_factor REAL NOT NULL,
+                    burn_offset_kcal INTEGER NOT NULL DEFAULT 0,
+                    dynamic_mode TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
 
     @staticmethod
     def _now() -> str:
@@ -1155,6 +1168,8 @@ class NutritionStore:
         self,
         end_local_date: str,
         window_days: int = 14,
+        *,
+        exclude_end_date_meals: bool = False,
     ) -> AdaptiveTdeeEstimate | None:
         end_d = date.fromisoformat(end_local_date)
         start_d = end_d - timedelta(days=max(7, window_days) - 1)
@@ -1179,6 +1194,11 @@ class NutritionStore:
                 """,
                 (start_str, end_str),
             ).fetchall()
+
+        if exclude_end_date_meals:
+            completed_meals = [r for r in meal_rows if str(r["local_date"]) < end_str]
+            if len(completed_meals) >= 7:
+                meal_rows = completed_meals
 
         days_logged = len(meal_rows)
         if days_logged < 7 or len(weight_rows) < 2:
@@ -1455,9 +1475,39 @@ class NutritionStore:
         return synced
 
     def get_garmin_runtime_settings(
-        self, fallback_cfg: FoodTrackerConfig | None = None
+        self,
+        fallback_cfg: FoodTrackerConfig | None = None,
+        *,
+        local_date: str | None = None,
     ) -> dict[str, object]:
         cfg = fallback_cfg or FoodTrackerConfig()
+        if local_date is not None:
+            with self._connect() as conn:
+                hist_row = conn.execute(
+                    """
+                    SELECT dynamic_enabled, goal_delta_kcal, active_factor,
+                           burn_offset_kcal, dynamic_mode
+                    FROM garmin_settings_history
+                    WHERE effective_date <= ?
+                    ORDER BY effective_date DESC
+                    LIMIT 1
+                    """,
+                    (local_date,),
+                ).fetchone()
+            if hist_row is not None:
+                mode_val = str(hist_row["dynamic_mode"])
+                return {
+                    "dynamic_enabled": bool(hist_row["dynamic_enabled"]),
+                    "goal_delta_kcal": max(-1500, min(1500, int(hist_row["goal_delta_kcal"]))),
+                    "active_factor": round(max(0.0, min(1.5, float(hist_row["active_factor"]))), 2),
+                    "burn_offset_kcal": max(-600, min(600, int(hist_row["burn_offset_kcal"]))),
+                    "dynamic_mode": (
+                        mode_val
+                        if mode_val in ("rolling_baseline", "daily_burn")
+                        else cfg.garmin_dynamic_mode
+                    ),
+                }
+
         dyn_override = self.get_food_setting("garmin_dynamic_enabled")
         dyn_enabled = (
             dyn_override.strip().lower() in {"1", "true", "yes", "on"}
@@ -1472,6 +1522,7 @@ class NutritionStore:
                 goal_delta = int(delta_override)
             except ValueError:
                 pass
+        goal_delta = max(-1500, min(1500, goal_delta))
 
         factor_override = self.get_food_setting("garmin_active_factor")
         active_factor = float(cfg.garmin_active_factor)
@@ -1481,6 +1532,15 @@ class NutritionStore:
             except ValueError:
                 pass
         active_factor = round(max(0.0, min(1.5, active_factor)), 2)
+
+        burn_offset_override = self.get_food_setting("garmin_burn_offset_kcal")
+        burn_offset = int(getattr(cfg, "garmin_burn_offset_kcal", 0))
+        if burn_offset_override is not None:
+            try:
+                burn_offset = int(round(float(burn_offset_override)))
+            except ValueError:
+                pass
+        burn_offset = max(-600, min(600, burn_offset))
 
         mode_override = self.get_food_setting("garmin_dynamic_mode")
         mode = (
@@ -1492,7 +1552,260 @@ class NutritionStore:
             "dynamic_enabled": dyn_enabled,
             "goal_delta_kcal": goal_delta,
             "active_factor": active_factor,
+            "burn_offset_kcal": burn_offset,
             "dynamic_mode": mode,
+        }
+
+    def save_garmin_settings(
+        self,
+        *,
+        local_date: str,
+        fallback_cfg: FoodTrackerConfig | None = None,
+        dynamic_enabled: bool | None = None,
+        goal_delta_kcal: int | None = None,
+        active_factor: float | None = None,
+        burn_offset_kcal: int | None = None,
+        dynamic_mode: str | None = None,
+        backfill: bool = False,
+    ) -> dict[str, object]:
+        """Persist Garmin dynamic target settings and record a date-versioned history entry."""
+        cfg = fallback_cfg or FoodTrackerConfig()
+        prev = self.get_garmin_runtime_settings(cfg)
+        new_dyn = bool(prev["dynamic_enabled"]) if dynamic_enabled is None else bool(dynamic_enabled)
+        new_delta = (
+            int(prev["goal_delta_kcal"])  # type: ignore[arg-type]
+            if goal_delta_kcal is None
+            else max(-1500, min(1500, int(goal_delta_kcal)))
+        )
+        new_factor = (
+            float(prev["active_factor"])  # type: ignore[arg-type]
+            if active_factor is None
+            else round(max(0.0, min(1.5, float(active_factor))), 2)
+        )
+        new_offset = (
+            int(prev["burn_offset_kcal"])  # type: ignore[arg-type]
+            if burn_offset_kcal is None
+            else max(-600, min(600, int(round(burn_offset_kcal))))
+        )
+        if dynamic_mode is not None:
+            if dynamic_mode not in ("rolling_baseline", "daily_burn"):
+                raise ValueError(f"Invalid dynamic_mode: {dynamic_mode!r}")
+            new_mode = dynamic_mode
+        else:
+            new_mode = str(prev["dynamic_mode"])
+
+        now = self._now()
+        with self._connect() as conn:
+            for k, v in (
+                ("garmin_dynamic_enabled", "true" if new_dyn else "false"),
+                ("garmin_goal_delta_kcal", str(new_delta)),
+                ("garmin_active_factor", str(new_factor)),
+                ("garmin_burn_offset_kcal", str(new_offset)),
+                ("garmin_dynamic_mode", new_mode),
+            ):
+                conn.execute(
+                    """
+                    INSERT INTO food_settings (key, value, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value,
+                        updated_at = excluded.updated_at
+                    """,
+                    (k, v, now),
+                )
+
+            if backfill:
+                conn.execute(
+                    "DELETE FROM garmin_settings_history WHERE effective_date <= ?",
+                    (local_date,),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO garmin_settings_history (
+                        effective_date, dynamic_enabled, goal_delta_kcal,
+                        active_factor, burn_offset_kcal, dynamic_mode, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(effective_date) DO UPDATE SET
+                        dynamic_enabled = excluded.dynamic_enabled,
+                        goal_delta_kcal = excluded.goal_delta_kcal,
+                        active_factor = excluded.active_factor,
+                        burn_offset_kcal = excluded.burn_offset_kcal,
+                        dynamic_mode = excluded.dynamic_mode,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        "1970-01-01",
+                        1 if new_dyn else 0,
+                        new_delta,
+                        new_factor,
+                        new_offset,
+                        new_mode,
+                        now,
+                    ),
+                )
+            else:
+                hist_count = int(
+                    conn.execute("SELECT COUNT(*) FROM garmin_settings_history").fetchone()[0]
+                )
+                if hist_count == 0:
+                    conn.execute(
+                        """
+                        INSERT INTO garmin_settings_history (
+                            effective_date, dynamic_enabled, goal_delta_kcal,
+                            active_factor, burn_offset_kcal, dynamic_mode, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            "1970-01-01",
+                            1 if bool(prev["dynamic_enabled"]) else 0,
+                            int(prev["goal_delta_kcal"]),  # type: ignore[arg-type]
+                            float(prev["active_factor"]),  # type: ignore[arg-type]
+                            int(prev["burn_offset_kcal"]),  # type: ignore[arg-type]
+                            str(prev["dynamic_mode"]),
+                            now,
+                        ),
+                    )
+                conn.execute(
+                    """
+                    INSERT INTO garmin_settings_history (
+                        effective_date, dynamic_enabled, goal_delta_kcal,
+                        active_factor, burn_offset_kcal, dynamic_mode, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(effective_date) DO UPDATE SET
+                        dynamic_enabled = excluded.dynamic_enabled,
+                        goal_delta_kcal = excluded.goal_delta_kcal,
+                        active_factor = excluded.active_factor,
+                        burn_offset_kcal = excluded.burn_offset_kcal,
+                        dynamic_mode = excluded.dynamic_mode,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        local_date,
+                        1 if new_dyn else 0,
+                        new_delta,
+                        new_factor,
+                        new_offset,
+                        new_mode,
+                        now,
+                    ),
+                )
+
+        return {
+            "dynamic_enabled": new_dyn,
+            "goal_delta_kcal": new_delta,
+            "active_factor": new_factor,
+            "burn_offset_kcal": new_offset,
+            "dynamic_mode": new_mode,
+        }
+
+    def compute_burn_calibration(
+        self,
+        end_local_date: str,
+        fallback_cfg: FoodTrackerConfig | None = None,
+        *,
+        window_days: int = 14,
+        active_factor_override: float | None = None,
+    ) -> dict[str, object] | None:
+        """Compute additive BMR/TDEE burn calibration comparing Garmin burn to scale Adaptive TDEE."""
+        cfg = fallback_cfg or FoodTrackerConfig()
+        end_d = date.fromisoformat(end_local_date)
+        span = max(7, min(60, window_days))
+        start_str = (end_d - timedelta(days=span - 1)).isoformat()
+
+        tdee = self.estimate_adaptive_tdee(
+            end_local_date, window_days=span, exclude_end_date_meals=True
+        )
+        all_garmin = [
+            d for d in self.list_garmin_range(start_str, end_local_date) if d.bmr_full_day_kcal > 0
+        ]
+        completed_garmin = [d for d in all_garmin if d.local_date < end_local_date]
+        garmin_rows = completed_garmin if len(completed_garmin) >= 5 else all_garmin
+        if tdee is None or len(garmin_rows) < 5:
+            return None
+
+        avg_raw_burn = sum(d.total_burn_kcal for d in garmin_rows) / len(garmin_rows)
+        avg_bmr = sum(d.bmr_full_day_kcal for d in garmin_rows) / len(garmin_rows)
+        avg_active = sum(d.active_kcal for d in garmin_rows) / len(garmin_rows)
+        if avg_raw_burn <= 0 or tdee.estimated_tdee_kcal <= 0:
+            return None
+
+        rt = self.get_garmin_runtime_settings(cfg, local_date=end_local_date)
+        current_active_factor = float(rt["active_factor"])  # type: ignore[arg-type]
+        current_burn_offset = int(rt["burn_offset_kcal"])  # type: ignore[arg-type]
+        if active_factor_override is not None:
+            target_active_factor = round(max(0.0, min(1.5, float(active_factor_override))), 2)
+        elif current_active_factor > 1.0:
+            target_active_factor = round(max(0.0, min(1.5, float(cfg.garmin_active_factor))), 2)
+        else:
+            target_active_factor = current_active_factor
+
+        avg_model_burn = avg_bmr + avg_active * target_active_factor
+        avg_current_burn = avg_bmr + avg_active * current_active_factor + current_burn_offset
+        raw_offset = tdee.estimated_tdee_kcal - avg_model_burn
+        rec_burn_offset = int(round(max(-600.0, min(600.0, raw_offset))))
+        raw_bias_pct = round(
+            ((avg_raw_burn - tdee.estimated_tdee_kcal) / tdee.estimated_tdee_kcal) * 100.0, 1
+        )
+        calibrated_bias_pct = round(
+            ((avg_current_burn - tdee.estimated_tdee_kcal) / tdee.estimated_tdee_kcal) * 100.0, 1
+        )
+        needs_calibration = (
+            abs(rec_burn_offset - current_burn_offset) >= 25 or current_active_factor > 1.0
+        )
+
+        return {
+            "adaptive_tdee_kcal": tdee.estimated_tdee_kcal,
+            "avg_garmin_burn_kcal": round(avg_raw_burn, 1),
+            "avg_model_burn_kcal": round(avg_model_burn, 1),
+            "avg_calibrated_burn_kcal": round(avg_current_burn, 1),
+            "bias_pct": raw_bias_pct,
+            "calibrated_bias_pct": calibrated_bias_pct,
+            "current_burn_offset_kcal": current_burn_offset,
+            "recommended_burn_offset_kcal": rec_burn_offset,
+            "recommended_active_factor": target_active_factor,
+            "needs_calibration": needs_calibration,
+        }
+
+    def run_burn_calibration_backfill_once(
+        self,
+        today_local_date: str,
+        fallback_cfg: FoodTrackerConfig | None = None,
+    ) -> dict[str, object] | None:
+        """One-time migration: replace legacy active_factor calibration with additive burn offset and backfill history."""
+        if self.get_food_setting("burn_calibration_backfill_v1_done") is not None:
+            return None
+
+        cfg = fallback_cfg or FoodTrackerConfig()
+        rt = self.get_garmin_runtime_settings(cfg)
+        current_factor = float(rt["active_factor"])  # type: ignore[arg-type]
+        clean_factor = (
+            round(max(0.0, min(1.5, float(cfg.garmin_active_factor))), 2)
+            if current_factor > 1.0
+            else current_factor
+        )
+        cal = self.compute_burn_calibration(
+            today_local_date,
+            cfg,
+            window_days=14,
+            active_factor_override=clean_factor,
+        )
+        if cal is None:
+            return None
+
+        rec_offset = int(cal["recommended_burn_offset_kcal"])  # type: ignore[arg-type]
+        saved = self.save_garmin_settings(
+            local_date=today_local_date,
+            fallback_cfg=cfg,
+            active_factor=clean_factor,
+            burn_offset_kcal=rec_offset,
+            backfill=True,
+        )
+        self.set_food_setting("burn_calibration_backfill_v1_done", self._now())
+        return {
+            "active_factor": saved["active_factor"],
+            "burn_offset_kcal": saved["burn_offset_kcal"],
+            "adaptive_tdee_kcal": cal["adaptive_tdee_kcal"],
+            "avg_model_burn_kcal": cal["avg_model_burn_kcal"],
         }
 
     def resolve_effective_target(
@@ -1503,10 +1816,11 @@ class NutritionStore:
         """Compute static or Garmin-adjusted daily calorie & carb targets."""
         cfg = fallback_cfg or FoodTrackerConfig()
         base = self.get_target_for_date(local_date, cfg)
-        rt = self.get_garmin_runtime_settings(cfg)
+        rt = self.get_garmin_runtime_settings(cfg, local_date=local_date)
         dyn_enabled = bool(rt["dynamic_enabled"])
         goal_delta = int(rt["goal_delta_kcal"])  # type: ignore[arg-type]
         active_factor = float(rt["active_factor"])  # type: ignore[arg-type]
+        burn_offset = int(rt["burn_offset_kcal"])  # type: ignore[arg-type]
         mode = str(rt["dynamic_mode"])
 
         if not dyn_enabled or not cfg.garmin_enabled:
@@ -1537,12 +1851,15 @@ class NutritionStore:
 
         if mode == "daily_burn":
             workout_surplus = 0.0
-            raw_kcal = baseline_bmr + today_active * active_factor + goal_delta
+            raw_kcal = baseline_bmr + today_active * active_factor + burn_offset + goal_delta
             source = "garmin_daily"
         else:
             workout_surplus = max(0.0, today_active - baseline_active)
             raw_kcal = (
-                baseline_bmr + (baseline_active + workout_surplus) * active_factor + goal_delta
+                baseline_bmr
+                + (baseline_active + workout_surplus) * active_factor
+                + burn_offset
+                + goal_delta
             )
             source = "garmin_rolling"
 
@@ -1574,6 +1891,7 @@ class NutritionStore:
             active_factor=round(active_factor, 2),
             mode=mode,
             source=source,
+            burn_offset_kcal=burn_offset,
         )
         return effective, info
 
@@ -1615,10 +1933,19 @@ class NutritionStore:
         for offset in range(span):
             d_str = (start_d + timedelta(days=offset)).isoformat()
             day_sum = self.get_daily_summary(d_str, cfg)
+            day_rt = self.get_garmin_runtime_settings(cfg, local_date=d_str)
+            day_factor = float(day_rt["active_factor"])  # type: ignore[arg-type]
+            day_offset = int(day_rt["burn_offset_kcal"])  # type: ignore[arg-type]
             g = day_sum.garmin
             w_pair = weights_by_date.get(d_str)
             intake = day_sum.total_calories_kcal if day_sum.meals else None
-            burn = g.total_burn_kcal if g is not None and g.bmr_full_day_kcal > 0 else None
+            raw_burn = g.total_burn_kcal if g is not None and g.bmr_full_day_kcal > 0 else None
+            cal_burn = (
+                round(g.bmr_full_day_kcal + g.active_kcal * day_factor + day_offset, 1)
+                if g is not None and g.bmr_full_day_kcal > 0
+                else None
+            )
+            burn = cal_burn if (cal_burn is not None and day_offset != 0) else raw_burn
 
             if d_str >= recent_7d_start:
                 if g is not None:
@@ -1635,6 +1962,8 @@ class NutritionStore:
                     "intake_kcal": round(intake, 1) if intake is not None else None,
                     "target_kcal": day_sum.target.calories_kcal,
                     "garmin_burn_kcal": round(burn, 1) if burn is not None else None,
+                    "raw_garmin_burn_kcal": round(raw_burn, 1) if raw_burn is not None else None,
+                    "calibrated_burn_kcal": cal_burn,
                     "garmin_bmr_kcal": g.bmr_full_day_kcal if g else None,
                     "garmin_active_kcal": g.active_kcal if g else None,
                     "steps": g.steps if g else None,
@@ -1643,29 +1972,7 @@ class NutritionStore:
                 }
             )
 
-        calibration: dict[str, object] | None = None
-        tdee = self.estimate_adaptive_tdee(end_local_date, window_days=14)
-        garmin_rows = [
-            d for d in self.list_garmin_range(start_str, end_local_date) if d.bmr_full_day_kcal > 0
-        ]
-        if tdee is not None and len(garmin_rows) >= 5:
-            avg_burn = sum(d.total_burn_kcal for d in garmin_rows) / len(garmin_rows)
-            avg_bmr = sum(d.bmr_full_day_kcal for d in garmin_rows) / len(garmin_rows)
-            avg_active = sum(d.active_kcal for d in garmin_rows) / len(garmin_rows)
-            if avg_burn > 0:
-                bias_pct = round(
-                    ((avg_burn - tdee.estimated_tdee_kcal) / tdee.estimated_tdee_kcal) * 100.0, 1
-                )
-                rec_factor = None
-                if avg_active >= 50.0:
-                    raw_factor = (tdee.estimated_tdee_kcal - avg_bmr) / avg_active
-                    rec_factor = round(max(0.4, min(1.3, raw_factor)), 2)
-                calibration = {
-                    "adaptive_tdee_kcal": tdee.estimated_tdee_kcal,
-                    "avg_garmin_burn_kcal": round(avg_burn, 1),
-                    "bias_pct": bias_pct,
-                    "recommended_active_factor": rec_factor,
-                }
+        calibration = self.compute_burn_calibration(end_local_date, cfg, window_days=14)
 
         return {
             "start_date": start_str,

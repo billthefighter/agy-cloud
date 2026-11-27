@@ -1182,3 +1182,141 @@ def test_meal_reaction_emoji_persistence_and_validation(tmp_path: Path) -> None:
 
     with pytest.raises(KeyError):
         store.set_meal_reaction(999999, "💪")
+
+
+def test_additive_burn_calibration_one_time_backfill_and_date_versioned_settings(
+    tmp_path: Path,
+) -> None:
+    from datetime import date
+
+    from agent_tasks.tasks.food_tracker.models import GarminDailyMetric
+
+    store = NutritionStore(tmp_path / "nutrition.sqlite3")
+    cfg = FoodTrackerConfig(
+        garmin_enabled=True,
+        garmin_dynamic_targets_enabled=True,
+        garmin_dynamic_mode="rolling_baseline",
+        garmin_active_factor=0.80,
+        garmin_goal_delta_kcal=-250,
+    )
+
+    # Simulate legacy state: active_factor pegged at 1.3 from old calibrator
+    store.set_food_setting("garmin_goal_delta_kcal", "-250")
+    store.set_food_setting("garmin_dynamic_mode", "rolling_baseline")
+    store.set_food_setting("garmin_active_factor", "1.3")
+
+    start_day = date(2026, 11, 14)
+    for offset in range(13):
+        d_str = (start_day + timedelta(days=offset)).isoformat()
+        store.upsert_garmin_daily(
+            GarminDailyMetric(
+                local_date=d_str,
+                bmr_raw_kcal=2370.0,
+                bmr_full_day_kcal=2370.0,
+                active_kcal=250.0,
+                total_burn_kcal=2620.0,
+                steps=5000,
+            )
+        )
+        if offset >= 2:
+            store.create_meal_entry(
+                local_date=d_str,
+                raw_description="full day meals",
+                estimate=MealEstimateSchema(
+                    title="Daily Meals",
+                    meal_slot="dinner",
+                    confidence="high",
+                    items=[
+                        EstimatedMealItem(
+                            name="Meals",
+                            quantity_desc="1 day",
+                            calories_kcal=2480.0,
+                            protein_g=160.0,
+                            carbs_g=240.0,
+                            fat_g=70.0,
+                        )
+                    ],
+                ),
+                model_used="test-model",
+            )
+    # Add partial intake on today (2026-11-27) that must NOT drag down Adaptive TDEE
+    today_str = "2026-11-27"
+    store.create_meal_entry(
+        local_date=today_str,
+        raw_description="coffee and snack",
+        estimate=MealEstimateSchema(
+            title="Morning Snack",
+            meal_slot="breakfast",
+            confidence="high",
+            items=[
+                EstimatedMealItem(
+                    name="Snack",
+                    quantity_desc="1",
+                    calories_kcal=400.0,
+                    protein_g=10.0,
+                    carbs_g=50.0,
+                    fat_g=15.0,
+                )
+            ],
+        ),
+        model_used="test-model",
+    )
+    # Steady weight drop: 222.8 -> 221.3 over 13 days
+    store.log_weight(local_date="2026-11-14", weight_lbs=222.8)
+    store.log_weight(local_date="2026-11-20", weight_lbs=221.6)
+    store.log_weight(local_date=today_str, weight_lbs=221.0)
+
+    # Excluding today's partial 400 kcal meal keeps avg_daily_kcal at 2480.0
+    tdee_complete = store.estimate_adaptive_tdee(today_str, exclude_end_date_meals=True)
+    tdee_with_today = store.estimate_adaptive_tdee(today_str, exclude_end_date_meals=False)
+    assert tdee_complete is not None and tdee_with_today is not None
+    assert tdee_complete.avg_daily_kcal == 2480.0
+    assert tdee_complete.estimated_tdee_kcal > tdee_with_today.estimated_tdee_kcal
+
+    # Calibration recommends an additive offset relative to default 0.80 active factor
+    cal_before = store.compute_burn_calibration(today_str, cfg)
+    assert cal_before is not None
+    assert cal_before["recommended_active_factor"] == 0.8
+    assert cal_before["needs_calibration"] is True
+    rec_offset = int(cal_before["recommended_burn_offset_kcal"])  # type: ignore[arg-type]
+    assert 0 < rec_offset <= 600
+
+    # One-time backfill resets 1.3 -> 0.80, applies burn_offset_kcal, and backfills historical days
+    backfill_res = store.run_burn_calibration_backfill_once(today_str, cfg)
+    assert backfill_res is not None
+    assert backfill_res["active_factor"] == 0.8
+    assert backfill_res["burn_offset_kcal"] == rec_offset
+
+    # Running a second time is a strict no-op
+    assert store.run_burn_calibration_backfill_once(today_str, cfg) is None
+
+    # Past day (2026-11-25) now reflects the backfilled calibrated allowance & burn
+    past_sum = store.get_daily_summary("2026-11-25", cfg)
+    assert past_sum.dynamic_target is not None
+    assert past_sum.dynamic_target.active_factor == 0.8
+    assert past_sum.dynamic_target.burn_offset_kcal == rec_offset
+    expected_past_kcal = round(2370.0 + 250.0 * 0.8 + rec_offset - 250)
+    assert past_sum.target.calories_kcal == expected_past_kcal
+
+    # Trends use calibrated burn and report calibrated status
+    trends = store.get_food_dashboard_trends(today_str, cfg, days=14)
+    assert trends["calibration"] is not None
+    cal_after = trends["calibration"]
+    assert isinstance(cal_after, dict)
+    assert cal_after["current_burn_offset_kcal"] == rec_offset
+    assert cal_after["needs_calibration"] is False
+    series = trends["series"]
+    assert isinstance(series, list)
+    nov25 = next(row for row in series if row["local_date"] == "2026-11-25")
+    assert nov25["raw_garmin_burn_kcal"] == 2620.0
+    assert nov25["calibrated_burn_kcal"] == round(2370.0 + 250.0 * 0.8 + rec_offset, 1)
+    assert nov25["garmin_burn_kcal"] == nov25["calibrated_burn_kcal"]
+
+    # Future settings changes apply from today forward WITHOUT rewriting past days
+    store.save_garmin_settings(local_date=today_str, fallback_cfg=cfg, goal_delta_kcal=-500)
+    past_after = store.get_daily_summary("2026-11-25", cfg)
+    today_after = store.get_daily_summary(today_str, cfg)
+    assert past_after.target.calories_kcal == expected_past_kcal
+    assert today_after.dynamic_target is not None
+    assert today_after.dynamic_target.goal_delta_kcal == -500
+    assert today_after.target.calories_kcal == expected_past_kcal - 250

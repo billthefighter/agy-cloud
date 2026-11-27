@@ -279,6 +279,7 @@ class FoodTrackerConfig(pydantic.BaseModel):
     garmin_dynamic_targets_enabled: bool = True
     garmin_dynamic_mode: Literal["rolling_baseline", "daily_burn"] = "rolling_baseline"
     garmin_active_factor: float = 0.80
+    garmin_burn_offset_kcal: int = 0
     garmin_goal_delta_kcal: int = 0
     garmin_min_calories_kcal: int = 1600
     garmin_max_calories_kcal: int = 4000

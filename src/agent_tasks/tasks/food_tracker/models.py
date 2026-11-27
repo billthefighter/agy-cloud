@@ -198,6 +198,7 @@ class DynamicTargetInfo:
     active_factor: float
     mode: str
     source: str
+    burn_offset_kcal: int = 0
 
 
 @dataclass(slots=True)

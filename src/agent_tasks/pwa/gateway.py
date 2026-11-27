@@ -399,6 +399,8 @@ class _GarminSettingsRequest(BaseModel):
     goal_delta_kcal: int | None = None
     dynamic_mode: str | None = None
     active_factor: float | None = None
+    burn_offset_kcal: int | None = None
+    backfill: bool = False
 
 
 class _BillingCmdRequest(BaseModel):
@@ -1156,11 +1158,14 @@ class PwaGatewayAdapter:
         if self.food_task is None:
             raise HTTPException(status_code=503, detail="Food tracker is not enabled.")
         cfg = self._load_targets().food_tracker
-        target_date = (local_date or "").strip() or self.food_task._today_local_date(cfg)
+        today_date = self.food_task._today_local_date(cfg)
+        target_date = (local_date or "").strip() or today_date
         summary = self.food_task.nutrition.get_daily_summary(target_date, cfg)
         staples = self.food_task.nutrition.list_saved_foods()
         latest_w = self.food_task.nutrition.get_latest_weight()
-        tdee = self.food_task.nutrition.estimate_adaptive_tdee(target_date)
+        tdee = self.food_task.nutrition.estimate_adaptive_tdee(
+            target_date, exclude_end_date_meals=(target_date == today_date)
+        )
         rt_settings = self.food_task.nutrition.get_garmin_runtime_settings(cfg)
         readiness_warning: str | None = None
         if summary.garmin is not None and summary.dynamic_target is not None:
@@ -2225,7 +2230,9 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
         today = gateway.food_task._today_local_date(cfg)
         weekly = gateway.food_task.nutrition.get_weekly_summary(today, cfg)
         latest_w = gateway.food_task.nutrition.get_latest_weight()
-        tdee = gateway.food_task.nutrition.estimate_adaptive_tdee(today)
+        tdee = gateway.food_task.nutrition.estimate_adaptive_tdee(
+            today, exclude_end_date_meals=True
+        )
         data = asdict(weekly)
         data["daily_totals"] = [
             {
@@ -2662,24 +2669,21 @@ def create_pwa_app(gateway: PwaGatewayAdapter) -> FastAPI:
     async def food_garmin_settings(body: _GarminSettingsRequest) -> dict[str, Any]:
         if gateway.food_task is None:
             raise HTTPException(status_code=503, detail="Food tracker is not enabled.")
-        if body.dynamic_enabled is not None:
-            gateway.food_task.nutrition.set_food_setting(
-                "garmin_dynamic_enabled", "true" if body.dynamic_enabled else "false"
+        cfg = gateway._load_targets().food_tracker
+        today = gateway.food_task._today_local_date(cfg)
+        try:
+            gateway.food_task.nutrition.save_garmin_settings(
+                local_date=today,
+                fallback_cfg=cfg,
+                dynamic_enabled=body.dynamic_enabled,
+                goal_delta_kcal=body.goal_delta_kcal,
+                active_factor=body.active_factor,
+                burn_offset_kcal=body.burn_offset_kcal,
+                dynamic_mode=body.dynamic_mode,
+                backfill=body.backfill,
             )
-        if body.goal_delta_kcal is not None:
-            clamped_delta = max(-1500, min(1500, int(body.goal_delta_kcal)))
-            gateway.food_task.nutrition.set_food_setting(
-                "garmin_goal_delta_kcal", str(clamped_delta)
-            )
-        if body.dynamic_mode is not None:
-            if body.dynamic_mode not in ("rolling_baseline", "daily_burn"):
-                raise HTTPException(status_code=400, detail="Invalid dynamic_mode.")
-            gateway.food_task.nutrition.set_food_setting("garmin_dynamic_mode", body.dynamic_mode)
-        if body.active_factor is not None:
-            clamped_factor = round(max(0.0, min(1.5, float(body.active_factor))), 2)
-            gateway.food_task.nutrition.set_food_setting(
-                "garmin_active_factor", str(clamped_factor)
-            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         await gateway.broadcast("food.updated", {"source": "garmin_settings"})
         return gateway._build_food_today_payload()
 

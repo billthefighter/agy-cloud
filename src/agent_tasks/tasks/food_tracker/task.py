@@ -113,10 +113,11 @@ def _format_garmin_context_line(summary: DailySummary) -> str:
         surplus = (
             f", +{dt.workout_surplus_kcal:.0f} workout" if dt.workout_surplus_kcal >= 1.0 else ""
         )
+        cal_note = f", cal `{dt.burn_offset_kcal:+d}`" if dt.burn_offset_kcal else ""
         parts.append(
             f"🎯 *Dynamic Goal:* `{dt.effective_calories_kcal} kcal` "
             f"(baseline `{dt.baseline_bmr_kcal:.0f}` BMR + `{dt.baseline_active_kcal:.0f}` "
-            f"active ×{dt.active_factor:g}{surplus}, offset `{delta_sign}`)"
+            f"active ×{dt.active_factor:g}{surplus}{cal_note}, offset `{delta_sign}`)"
         )
     return "\n".join(parts)
 
@@ -710,7 +711,9 @@ class FoodTrackerTask:
                         return True
                     if goal_tokens[0].lower() == "deficit" and delta_val > 0:
                         delta_val = -delta_val
-                    self.nutrition.set_food_setting("garmin_goal_delta_kcal", str(delta_val))
+                    self.nutrition.save_garmin_settings(
+                        local_date=today, fallback_cfg=cfg, goal_delta_kcal=delta_val
+                    )
                     effective, dyn_info = self.nutrition.resolve_effective_target(today, cfg)
                     eff_str = (
                         f" Effective today: *{effective.calories_kcal} kcal* "
@@ -1434,16 +1437,20 @@ class FoodTrackerTask:
         sub = tokens[0].lower() if tokens else ""
 
         if sub == "dynamic" and len(tokens) >= 2:
+            today = self._today_local_date(cfg)
             choice = tokens[1].lower()
             if choice in ("on", "true", "1", "enable"):
-                self.nutrition.set_food_setting("garmin_dynamic_enabled", "true")
+                self.nutrition.save_garmin_settings(
+                    local_date=today, fallback_cfg=cfg, dynamic_enabled=True
+                )
                 state_lbl = "enabled"
             elif choice in ("off", "false", "0", "disable"):
-                self.nutrition.set_food_setting("garmin_dynamic_enabled", "false")
+                self.nutrition.save_garmin_settings(
+                    local_date=today, fallback_cfg=cfg, dynamic_enabled=False
+                )
                 state_lbl = "disabled"
             else:
                 return "Usage: `!garmin dynamic on` or `!garmin dynamic off`."
-            today = self._today_local_date(cfg)
             effective, _ = self.nutrition.resolve_effective_target(today, cfg)
             return (
                 f"Garmin dynamic calorie targets *{state_lbl}*. "
@@ -1511,10 +1518,11 @@ class FoodTrackerTask:
             lines.append("• *Recovery:* " + "  |  ".join(rec_bits))
         if summary.dynamic_target is not None:
             dt = summary.dynamic_target
+            cal_note = f", cal `{dt.burn_offset_kcal:+d}`" if dt.burn_offset_kcal else ""
             lines.append(
                 f"🎯 *Dynamic Target (`{dt.mode}`):* *{dt.effective_calories_kcal} kcal* "
                 f"(base {dt.base_calories_kcal}, offset `{dt.goal_delta_kcal:+d}`, "
-                f"active ×{dt.active_factor:g}) → `{summary.target.protein_g:.0f}P / "
+                f"active ×{dt.active_factor:g}{cal_note}) → `{summary.target.protein_g:.0f}P / "
                 f"{summary.target.carbs_g:.0f}C / {summary.target.fat_g:.0f}F`"
             )
         else:
@@ -1554,6 +1562,10 @@ class FoodTrackerTask:
                 except Exception as exc:  # noqa: BLE001
                     self._last_garmin_error_at = now
                     log.warning("food_tracker.garmin_sync_failed", error=str(exc))
+
+        backfill_res = self.nutrition.run_burn_calibration_backfill_once(local_date, cfg)
+        if backfill_res is not None:
+            log.info("food_tracker.burn_calibration_backfilled", **backfill_res)
 
         if cfg.daily_backup_enabled:
             backup_path = self.backups_dir / f"nutrition-{local_date}.sqlite3.gz"
